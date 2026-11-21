@@ -1,4 +1,4 @@
-"""Standalone verification test for database table creation and ORM roundtrips."""
+"""Standalone verification tests for database configuration, schema creation, and ORM behavior."""
 
 from __future__ import annotations
 
@@ -6,6 +6,8 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
+import pytest
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import sessionmaker
 
 # Allow running directly from repo root or backend/.
@@ -13,7 +15,8 @@ BACKEND_DIR = Path(__file__).resolve().parents[1]
 if str(BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(BACKEND_DIR))
 
-from app.core.database import build_engine, create_tables  # noqa: E402
+from app.core import database as db_module  # noqa: E402
+from app.core.database import build_engine, create_tables, get_database_url, get_db  # noqa: E402
 from app.models.entities import (  # noqa: E402
     AlertSeverity,
     AlertStatus,
@@ -26,6 +29,16 @@ from app.models.entities import (  # noqa: E402
     SecurityAlert,
     TelemetryMetric,
 )
+
+
+def test_get_database_url_fallback_and_override(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Verify DATABASE_URL falls back to local SQLite and respects env overrides."""
+    monkeypatch.delenv("DATABASE_URL", raising=False)
+    assert get_database_url() == db_module.DEFAULT_SQLITE_URL
+
+    custom_url = "postgresql+psycopg2://awsense:secret@localhost:5432/awsense"
+    monkeypatch.setenv("DATABASE_URL", custom_url)
+    assert get_database_url() == custom_url
 
 
 def test_create_tables_and_roundtrip(tmp_path: Path) -> None:
@@ -110,6 +123,97 @@ def test_create_tables_and_roundtrip(tmp_path: Path) -> None:
         assert fetched_rec is not None
         assert fetched_rec.state == RecommendationState.PENDING
         assert fetched_rec.estimated_monthly_savings_usd == 71.25
+
+    test_engine.dispose()
+
+
+def test_sqlite_foreign_keys_and_delete_behaviors(tmp_path: Path) -> None:
+    """Verify PRAGMA foreign_keys=ON enforces FK constraints, cascades, and SET NULL."""
+    db_file = tmp_path / "fk_test.db"
+    test_engine = build_engine(f"sqlite:///{db_file.as_posix()}")
+    create_tables(test_engine)
+    session_factory = sessionmaker(autocommit=False, autoflush=False, bind=test_engine)
+    now = datetime.now(timezone.utc)
+
+    # Orphaned metric must fail FK check.
+    with session_factory() as session:
+        session.add(
+            TelemetryMetric(
+                resource_id="i-nonexistent",
+                timestamp=now,
+                cpu_utilization=50.0,
+            )
+        )
+        with pytest.raises(IntegrityError):
+            session.commit()
+        session.rollback()
+
+    # Create resource with metric, recommendation, and alert; deleting resource cascades
+    # metrics/recommendations and preserves alert with resource_id=None.
+    with session_factory() as session:
+        resource = CloudResource(
+            resource_id="vol-0999",
+            resource_type=ResourceType.EBS,
+            region="us-west-2",
+            status="available",
+            utilization_pct=0.0,
+            backup_status=BackupStatus.MISSING,
+            monthly_cost_usd=25.0,
+        )
+        session.add(resource)
+        session.flush()
+        session.add_all(
+            [
+                TelemetryMetric(resource_id="vol-0999", timestamp=now, cpu_utilization=0.0),
+                Recommendation(
+                    recommendation_id="rec_vol_1",
+                    resource_id="vol-0999",
+                    category=RecommendationCategory.COST,
+                    title="Delete unattached EBS volume",
+                    action="Snapshot and delete vol-0999",
+                    estimated_monthly_savings_usd=25.0,
+                ),
+                SecurityAlert(
+                    alert_id="alert_vol_1",
+                    resource_id="vol-0999",
+                    alert_type="backup_missing",
+                    severity=AlertSeverity.MEDIUM,
+                    risk_score=45.0,
+                    title="Unattached volume missing snapshot",
+                ),
+            ]
+        )
+        session.commit()
+
+    with session_factory() as session:
+        res = session.get(CloudResource, "vol-0999")
+        assert res is not None
+        session.delete(res)
+        session.commit()
+
+    with session_factory() as session:
+        assert session.query(TelemetryMetric).count() == 0
+        assert session.query(Recommendation).count() == 0
+        alert = session.get(SecurityAlert, "alert_vol_1")
+        assert alert is not None
+        assert alert.resource_id is None
+
+    test_engine.dispose()
+
+
+def test_get_db_dependency_yields_and_closes(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Verify get_db() yields a usable session and closes it on teardown."""
+    db_file = tmp_path / "dep_test.db"
+    test_engine = build_engine(f"sqlite:///{db_file.as_posix()}")
+    create_tables(test_engine)
+    test_factory = sessionmaker(autocommit=False, autoflush=False, bind=test_engine)
+    monkeypatch.setattr(db_module, "SessionLocal", test_factory)
+
+    gen = get_db()
+    session = next(gen)
+    assert session.query(CloudResource).count() == 0
+    with pytest.raises(StopIteration):
+        next(gen)
 
     test_engine.dispose()
 
