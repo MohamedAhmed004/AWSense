@@ -1,20 +1,21 @@
-"""Correlated security and cost alerts endpoint."""
+"""Correlated security and cost alerts endpoint backed by SQLAlchemy and ML scoring."""
 
 from __future__ import annotations
 
 from datetime import datetime
+from typing import Any
 
-from fastapi import APIRouter, Query
+from fastapi import APIRouter, Depends, Query
 from pydantic import BaseModel, Field
+from sqlalchemy import select
+from sqlalchemy.orm import Session
 
-from app.models.entities import AlertSeverity, AlertStatus
-from app.services.correlator import (
-    CloudTrailEvent,
-    CostDelta,
-    MetricSpike,
-    SignalBreakdown,
-    correlate_signals,
-)
+from app.core.database import get_db
+from app.models.entities import AlertSeverity, AlertStatus, TelemetryMetric
+from app.services.ai_explainer import explain_incident
+from app.services.correlator import SignalBreakdown
+from app.services.ml_detector import score_metrics
+from app.services.repository import list_alerts
 
 router = APIRouter(prefix="/api/v1", tags=["alerts"])
 
@@ -28,6 +29,7 @@ class AlertItem(BaseModel):
     alert_type: str
     severity: AlertSeverity
     risk_score: float = Field(ge=0.0, le=100.0)
+    ml_score: float | None = Field(default=None, ge=0.0, le=1.0)
     title: str
     correlated_event_ids: list[str] = Field(default_factory=list)
     signal_breakdown: SignalBreakdown
@@ -44,159 +46,100 @@ class AlertsResponse(BaseModel):
     alerts: list[AlertItem]
 
 
-def _build_sample_alerts() -> tuple[AlertItem, ...]:
-    """Generate deterministic static alerts via the correlation engine."""
-    incidents = correlate_signals(
-        cloudtrail_events=[
-            # Scenario 1: Compromised IAM key in unused ap-southeast-1 region
-            CloudTrailEvent(
-                event_id="ct-9001",
-                timestamp="2026-11-21T02:14:00Z",
-                event_name="ConsoleLogin",
-                region="ap-southeast-1",
-                principal="ci-deploy-temp",
-                source_ip="185.220.101.42",
-                is_anomalous=True,
-                risk_hint=0.92,
-            ),
-            CloudTrailEvent(
-                event_id="ct-9002",
-                timestamp="2026-11-21T02:19:00Z",
-                event_name="AuthorizeSecurityGroupIngress",
-                region="ap-southeast-1",
-                principal="ci-deploy-temp",
-                resource_id="sg-0f8899aabbccdd",
-                is_anomalous=True,
-                risk_hint=0.88,
-            ),
-            CloudTrailEvent(
-                event_id="ct-9003",
-                timestamp="2026-11-21T02:23:00Z",
-                event_name="RunInstances",
-                region="ap-southeast-1",
-                principal="ci-deploy-temp",
-                resource_id="i-0f9e8d7c6b5a49999",
-                is_anomalous=True,
-                risk_hint=0.94,
-            ),
-            # Scenario 3: Moderate configuration change on orders RDS
-            CloudTrailEvent(
-                event_id="ct-9010",
-                timestamp="2026-11-20T16:10:00Z",
-                event_name="ModifyDBInstance",
-                region="us-east-1",
-                principal="ops-maintenance",
-                resource_id="db-prod-orders-01",
-                is_anomalous=False,
-                risk_hint=0.52,
-            ),
-        ],
-        metric_spikes=[
-            MetricSpike(
-                event_id="cw-9004",
-                timestamp="2026-11-21T02:35:00Z",
-                resource_id="i-0f9e8d7c6b5a49999",
-                metric_name="CPUUtilization",
-                value=96.2,
-                baseline=12.0,
-                region="ap-southeast-1",
-                anomaly_score=0.93,
-            ),
-            # Scenario 2: Automated bot scraper traffic driving web tier CPU + cost
-            MetricSpike(
-                event_id="cw-9021",
-                timestamp="2026-11-20T19:05:00Z",
-                resource_id="i-0a1b2c3d4e5f60002",
-                metric_name="RequestCount",
-                value=2410000.0,
-                baseline=148500.0,
-                region="us-east-1",
-                anomaly_score=0.86,
-            ),
-            MetricSpike(
-                event_id="cw-9022",
-                timestamp="2026-11-20T19:15:00Z",
-                resource_id="i-0a1b2c3d4e5f60002",
-                metric_name="CPUUtilization",
-                value=91.4,
-                baseline=31.0,
-                region="us-east-1",
-                anomaly_score=0.81,
-            ),
-            # Scenario 3: Correlated RDS CPU pressure
-            MetricSpike(
-                event_id="cw-9011",
-                timestamp="2026-11-20T16:28:00Z",
-                resource_id="db-prod-orders-01",
-                metric_name="CPUUtilization",
-                value=64.0,
-                baseline=35.0,
-                region="us-east-1",
-                anomaly_score=0.45,
-            ),
-        ],
-        cost_deltas=[
-            CostDelta(
-                event_id="ce-9005",
-                timestamp="2026-11-21T02:50:00Z",
-                service="AmazonEC2",
-                delta_usd=420.50,
-                baseline_usd=65.00,
-                delta_pct=646.9,
-                resource_id="i-0f9e8d7c6b5a49999",
-                region="ap-southeast-1",
-            ),
-            CostDelta(
-                event_id="ce-9023",
-                timestamp="2026-11-20T19:35:00Z",
-                service="AWSDataTransfer",
-                delta_usd=138.20,
-                baseline_usd=28.00,
-                delta_pct=493.6,
-                resource_id="i-0a1b2c3d4e5f60002",
-                region="us-east-1",
-            ),
-        ],
-        time_window_minutes=60,
-        min_signals=2,
+def _normalize_breakdown(raw: dict[str, Any] | None) -> SignalBreakdown:
+    """Fill default values so alerts without full signal counts still validate cleanly."""
+    data = raw or {}
+    return SignalBreakdown(
+        cloudtrail_count=int(data.get("cloudtrail_count", 0)),
+        metric_spike_count=int(data.get("metric_spike_count", 0)),
+        cost_delta_count=int(data.get("cost_delta_count", 0)),
+        iam_risk=float(data.get("iam_risk", 0.0)),
+        resource_impact=float(data.get("resource_impact", 0.0)),
+        cost_impact=float(data.get("cost_impact", 0.0)),
+        traffic_anomaly=float(data.get("traffic_anomaly", 0.0)),
+        total_cost_delta_usd=float(data.get("total_cost_delta_usd", 0.0)),
     )
 
-    items: list[AlertItem] = []
-    for index, inc in enumerate(incidents):
-        status = AlertStatus.INVESTIGATING if index == 1 else AlertStatus.OPEN
-        items.append(
-            AlertItem(
-                alert_id=f"alert_{inc.incident_id}",
-                resource_id=inc.primary_resource_id,
-                resource_ids=inc.resource_ids,
-                alert_type=inc.incident_type,
-                severity=inc.severity,
-                risk_score=inc.risk_score,
-                title=inc.title,
-                correlated_event_ids=inc.correlated_event_ids,
-                signal_breakdown=inc.signal_breakdown,
-                summary=inc.summary,
-                recommended_actions=inc.recommended_actions,
-                status=status,
-                created_at=inc.window_end,
-            )
-        )
-    return tuple(items)
 
+def _compute_ml_scores_by_resource(db: Session) -> dict[str, float]:
+    """Compute peak IsolationForest anomaly score per resource from stored TelemetryMetrics."""
+    rows = list(db.scalars(select(TelemetryMetric)).all())
+    if not rows:
+        return {}
 
-_SAMPLE_ALERTS: tuple[AlertItem, ...] = _build_sample_alerts()
+    records_by_resource: dict[str, list[dict[str, Any]]] = {}
+    baseline_rows: list[dict[str, Any]] = []
+
+    for row in rows:
+        payload = {
+            "resource_id": row.resource_id,
+            "cpu_utilization": float(row.cpu_utilization),
+            "network_in_bytes": float(row.network_in_bytes),
+            "network_out_bytes": float(row.network_out_bytes),
+            "request_count": int(row.request_count),
+        }
+        records_by_resource.setdefault(row.resource_id, []).append(payload)
+        if row.cpu_utilization < 80.0 and row.request_count < 1_000_000:
+            baseline_rows.append(payload)
+
+    if len(baseline_rows) < 10:
+        return {}
+
+    scores_by_resource: dict[str, float] = {}
+    for rid, target_rows in records_by_resource.items():
+        scores = score_metrics(baseline_rows, target_rows)
+        if scores:
+            scores_by_resource[rid] = round(max(scores), 4)
+    return scores_by_resource
 
 
 @router.get("/alerts", response_model=AlertsResponse)
 def get_alerts(
     severity: AlertSeverity | None = Query(default=None),
     status: AlertStatus | None = Query(default=None),
+    db: Session = Depends(get_db),
 ) -> AlertsResponse:
-    """Return correlated security and cost-impact alerts with risk score breakdowns."""
-    filtered = [
-        alert
-        for alert in _SAMPLE_ALERTS
-        if (severity is None or alert.severity == severity)
-        and (status is None or alert.status == status)
-    ]
-    return AlertsResponse(total=len(filtered), alerts=filtered)
+    """Return correlated security and cost-impact alerts from the database."""
+    rows = list_alerts(db, severity=severity, status=status)
+    ml_scores = _compute_ml_scores_by_resource(db)
+
+    items: list[AlertItem] = []
+    for row in rows:
+        breakdown = _normalize_breakdown(row.signal_breakdown)
+        resource_ids = [row.resource_id] if row.resource_id else []
+        summary = row.ai_summary
+        actions = list(row.recommended_actions or [])
+
+        if not summary or not actions:
+            explained = explain_incident(
+                {
+                    "title": row.title,
+                    "resource_ids": resource_ids,
+                    "signals": [{"event_id": eid} for eid in (row.correlated_event_ids or [])],
+                    "signal_breakdown": breakdown.model_dump(),
+                }
+            )
+            summary = summary or explained["summary"]
+            if not actions:
+                actions = explained["recommended_actions"]
+
+        items.append(
+            AlertItem(
+                alert_id=row.alert_id,
+                resource_id=row.resource_id,
+                resource_ids=resource_ids,
+                alert_type=row.alert_type,
+                severity=row.severity,
+                risk_score=row.risk_score,
+                ml_score=ml_scores.get(row.resource_id) if row.resource_id else None,
+                title=row.title,
+                correlated_event_ids=list(row.correlated_event_ids or []),
+                signal_breakdown=breakdown,
+                summary=summary,
+                recommended_actions=actions,
+                status=row.status,
+                created_at=row.created_at,
+            )
+        )
+
+    return AlertsResponse(total=len(items), alerts=items)

@@ -1,4 +1,4 @@
-"""FastAPI TestClient tests for all AWSense Task 3 API routers."""
+"""FastAPI TestClient tests for all AWSense API routers backed by SQLite."""
 
 from __future__ import annotations
 
@@ -8,32 +8,49 @@ from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
+from sqlalchemy.orm import Session, sessionmaker
 
 # Allow running directly from repo root or backend/.
 BACKEND_DIR = Path(__file__).resolve().parents[1]
 if str(BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(BACKEND_DIR))
 
-from app.api.recommendations import reset_recommendations_state  # noqa: E402
+from app.core import database  # noqa: E402
+from app.core.database import build_engine, get_db  # noqa: E402
 from app.main import app  # noqa: E402
 
 
-@pytest.fixture(autouse=True)
-def _reset_recommendations() -> Generator[None, None, None]:
-    """Ensure in-memory recommendation state is isolated across tests."""
-    reset_recommendations_state()
-    yield
-    reset_recommendations_state()
-
-
 @pytest.fixture
-def client() -> TestClient:
-    """Return a FastAPI TestClient wired to the main app."""
-    return TestClient(app)
+def client(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> Generator[TestClient, None, None]:
+    """Provide a TestClient running lifespan seeding against an isolated SQLite DB."""
+    db_file = tmp_path / "api_routes_test.db"
+    test_engine = build_engine(f"sqlite:///{db_file.as_posix()}")
+    test_factory = sessionmaker(autocommit=False, autoflush=False, bind=test_engine)
+
+    monkeypatch.setattr(database, "engine", test_engine)
+    monkeypatch.setattr(database, "SessionLocal", test_factory)
+
+    def _override_get_db() -> Generator[Session, None, None]:
+        db = test_factory()
+        try:
+            yield db
+        finally:
+            db.close()
+
+    app.dependency_overrides[get_db] = _override_get_db
+    try:
+        with TestClient(app) as test_client:
+            yield test_client
+    finally:
+        app.dependency_overrides.clear()
+        test_engine.dispose()
 
 
 def test_base_health_and_openapi_routes(client: TestClient) -> None:
-    """Verify baseline endpoints and OpenAPI registration of all Task 3 routers."""
+    """Verify baseline endpoints and OpenAPI registration of all API routers."""
     root_resp = client.get("/")
     assert root_resp.status_code == 200
     assert root_resp.json()["status"] == "ok"
@@ -52,6 +69,7 @@ def test_base_health_and_openapi_routes(client: TestClient) -> None:
         "/api/v1/traffic",
         "/api/v1/recommendations",
         "/api/v1/recommendations/{recommendation_id}/action",
+        "/api/v1/simulate",
     }
     assert expected_paths.issubset(set(paths.keys()))
 
@@ -66,6 +84,8 @@ def test_get_overview(client: TestClient) -> None:
     assert data["risk_level"] in {"low", "medium", "high", "critical"}
     assert data["total_monthly_savings_usd"] > 0
     assert data["monthly_spend_usd"] > 0
+    assert data["monitored_resources"] >= 14
+    assert data["unprotected_resources"] >= 2
 
     alerts = data["active_alerts"]
     assert alerts["total"] == (
@@ -77,13 +97,13 @@ def test_get_overview(client: TestClient) -> None:
 
 
 def test_get_resources_and_filters(client: TestClient) -> None:
-    """Verify GET /api/v1/resources inventory and query filters."""
+    """Verify GET /api/v1/resources inventory and query filters from DB."""
     resp = client.get("/api/v1/resources")
     assert resp.status_code == 200
     data = resp.json()
 
     assert data["summary"]["total"] == len(data["resources"])
-    assert data["summary"]["total"] >= 4
+    assert data["summary"]["total"] >= 14
     types = {item["resource_type"] for item in data["resources"]}
     assert {"ec2", "ebs", "rds", "s3"}.issubset(types)
 
@@ -102,12 +122,12 @@ def test_get_resources_and_filters(client: TestClient) -> None:
     region_resp = client.get("/api/v1/resources", params={"region": "ap-southeast-1"})
     assert region_resp.status_code == 200
     region_data = region_resp.json()
-    assert region_data["summary"]["total"] >= 1
+    assert region_data["summary"]["total"] == 8
     assert all(item["region"] == "ap-southeast-1" for item in region_data["resources"])
 
 
 def test_get_alerts_and_filters(client: TestClient) -> None:
-    """Verify GET /api/v1/alerts returns correlated incidents and honors filters."""
+    """Verify GET /api/v1/alerts returns correlated incidents, ML scores, and honors filters."""
     resp = client.get("/api/v1/alerts")
     assert resp.status_code == 200
     data = resp.json()
@@ -118,6 +138,8 @@ def test_get_alerts_and_filters(client: TestClient) -> None:
     first_alert = data["alerts"][0]
     assert first_alert["severity"] in {"low", "medium", "high", "critical"}
     assert 0.0 <= first_alert["risk_score"] <= 100.0
+    assert first_alert["ml_score"] is not None
+    assert 0.0 <= first_alert["ml_score"] <= 1.0
     assert len(first_alert["correlated_event_ids"]) >= 2
     assert first_alert["summary"]
     assert "iam_risk" in first_alert["signal_breakdown"]
@@ -129,10 +151,11 @@ def test_get_alerts_and_filters(client: TestClient) -> None:
     assert sev_data["total"] >= 1
     assert all(item["severity"] == first_alert["severity"] for item in sev_data["alerts"])
 
-    status_filter = client.get("/api/v1/alerts", params={"status": "investigating"})
+    status_filter = client.get("/api/v1/alerts", params={"status": "open"})
     assert status_filter.status_code == 200
     status_data = status_filter.json()
-    assert all(item["status"] == "investigating" for item in status_data["alerts"])
+    assert status_data["total"] >= 1
+    assert all(item["status"] == "open" for item in status_data["alerts"])
 
 
 def test_get_traffic(client: TestClient) -> None:
@@ -150,7 +173,7 @@ def test_get_traffic(client: TestClient) -> None:
 
 
 def test_recommendations_list_and_action_toggle(client: TestClient) -> None:
-    """Verify GET /api/v1/recommendations and POST /api/v1/recommendations/{id}/action."""
+    """Verify GET /api/v1/recommendations and pending/approved/dismissed DB persistence."""
     list_resp = client.get("/api/v1/recommendations")
     assert list_resp.status_code == 200
     list_data = list_resp.json()
@@ -184,6 +207,16 @@ def test_recommendations_list_and_action_toggle(client: TestClient) -> None:
     dismiss_data = dismiss_resp.json()
     assert dismiss_data["previous_state"] == "approved"
     assert dismiss_data["recommendation"]["state"] == "dismissed"
+
+    # Restore to pending (frontend Undo action).
+    undo_resp = client.post(
+        f"/api/v1/recommendations/{target_id}/action",
+        json={"action": "pending"},
+    )
+    assert undo_resp.status_code == 200
+    undo_data = undo_resp.json()
+    assert undo_data["previous_state"] == "dismissed"
+    assert undo_data["recommendation"]["state"] == "pending"
 
     # Unknown ID returns 404.
     missing_resp = client.post(
