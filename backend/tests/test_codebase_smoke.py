@@ -6,7 +6,6 @@ import json
 import shutil
 import subprocess
 import sys
-from collections.abc import Generator
 from pathlib import Path
 
 import pytest
@@ -23,7 +22,6 @@ from app.api.recommendations import (  # noqa: E402
     RecommendationActionRequest,
     act_on_recommendation,
     get_recommendations,
-    reset_recommendations_state,
 )
 from app.api.resources import get_resources  # noqa: E402
 from app.api.traffic import get_traffic  # noqa: E402
@@ -40,15 +38,8 @@ from app.services.repository import (  # noqa: E402
 )
 
 
-@pytest.fixture(autouse=True)
-def _reset_recs() -> Generator[None, None, None]:
-    reset_recommendations_state()
-    yield
-    reset_recommendations_state()
-
-
-def test_fastapi_routes_and_handlers_smoke() -> None:
-    """Verify all expected API paths are registered and handler functions return valid payloads."""
+def test_fastapi_routes_and_handlers_smoke(tmp_path: Path) -> None:
+    """Verify all expected API paths are registered and DB-backed handlers return valid payloads."""
     openapi_paths = set(app.openapi()["paths"].keys())
     expected_paths = {
         "/",
@@ -59,30 +50,51 @@ def test_fastapi_routes_and_handlers_smoke() -> None:
         "/api/v1/traffic",
         "/api/v1/recommendations",
         "/api/v1/recommendations/{recommendation_id}/action",
+        "/api/v1/simulate",
     }
     assert expected_paths.issubset(openapi_paths)
 
     assert read_root()["status"] == "ok"
     assert health_check() == {"status": "healthy"}
 
-    overview = get_overview()
-    assert 0.0 <= overview.health_score <= 100.0
-    assert overview.active_alerts.total >= 1
+    db_file = tmp_path / "handlers_smoke.db"
+    engine = build_engine(f"sqlite:///{db_file.as_posix()}")
+    create_tables(engine)
+    session_factory = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
-    resources = get_resources(resource_type=None, region=None, backup_status=None)
-    assert resources.summary.total == len(resources.resources) >= 4
+    with session_factory() as session:
+        seed_database(session)
 
-    alerts = get_alerts(severity=None, status=None)
-    assert alerts.total == len(alerts.alerts) >= 2
+        overview = get_overview(db=session)
+        assert 0.0 <= overview.health_score <= 100.0
+        assert overview.active_alerts.total >= 1
 
-    traffic = get_traffic()
-    assert traffic.bot_flags.flagged_bot_requests_24h > 0
+        resources = get_resources(resource_type=None, region=None, backup_status=None, db=session)
+        assert resources.summary.total == len(resources.resources) >= 14
 
-    recs = get_recommendations(category=None, state=None)
-    assert recs.total >= 4
-    first_id = recs.recommendations[0].recommendation_id
-    toggled = act_on_recommendation(first_id, RecommendationActionRequest(action="approved"))
-    assert toggled.recommendation.state == RecommendationState.APPROVED
+        alerts = get_alerts(severity=None, status=None, db=session)
+        assert alerts.total == len(alerts.alerts) >= 2
+
+        traffic = get_traffic()
+        assert traffic.bot_flags.flagged_bot_requests_24h > 0
+
+        recs = get_recommendations(category=None, state=None, db=session)
+        assert recs.total >= 4
+        first_id = recs.recommendations[0].recommendation_id
+        toggled = act_on_recommendation(
+            first_id,
+            RecommendationActionRequest(action="approved"),
+            db=session,
+        )
+        assert toggled.recommendation.state == RecommendationState.APPROVED
+        restored = act_on_recommendation(
+            first_id,
+            RecommendationActionRequest(action="pending"),
+            db=session,
+        )
+        assert restored.recommendation.state == RecommendationState.PENDING
+
+    engine.dispose()
 
 
 def test_end_to_end_provider_correlator_and_db_pipeline(tmp_path: Path) -> None:
