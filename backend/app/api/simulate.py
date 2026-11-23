@@ -1,326 +1,233 @@
 
 """Scenario simulation endpoint for AWSense."""
 
-from __future__ import annotations
-
-from datetime import datetime, timezone
 from typing import Any, Literal
-from uuid import uuid4
 
 from fastapi import APIRouter
 from pydantic import BaseModel
 
-from app.models.entities import RecommendationCategory, RecommendationState
-from app.services.correlator import correlate_signals, CorrelatedIncident
-from app.api.recommendations import RecommendationItem
+from app.services.auditor import (
+    audit_resources,
+    summarize_traffic_impact,
+)
+from app.services.telemetry_provider import get_telemetry_provider
 
 
 router = APIRouter(prefix="/api/v1", tags=["simulate"])
 
 
 class SimulationRequest(BaseModel):
-    """Request body for a simulation scenario."""
-
     scenario: Literal["iam_breach", "bot_traffic", "resource_waste"]
 
 
+class SimulationIncident(BaseModel):
+    title: str
+    risk_score: int
+    severity: str
+    summary: str
+    recommended_actions: list[str]
+
+
 class SimulationResponse(BaseModel):
-    """Response returned after running a simulation."""
-
-    scenario: str
-    signals: list[dict[str, Any]]
-    incident: CorrelatedIncident | None
-    recommendations: list[RecommendationItem]
+    incident: SimulationIncident
+    findings: list[str]
+    recommendations: list[dict[str, Any]]
 
 
-def _now() -> datetime:
-    """Return the current UTC timestamp."""
-    return datetime.now(timezone.utc)
+def simulate_iam_breach(provider: Any) -> SimulationResponse:
+    events = provider.get_cloudtrail_events()
 
+    suspicious_events = [
+        event for event in events
+        if event.get("is_anomalous") is True
+    ]
 
-def _recommendation(
-    resource_id: str,
-    category: RecommendationCategory,
-    title: str,
-    action: str,
-    rationale: str,
-    savings: float = 0.0,
-) -> RecommendationItem:
-    """Create a recommendation for the simulated scenario."""
+    findings = [
+        (
+            f"Suspicious event: {event.get('event_name')} "
+            f"by {event.get('principal')} "
+            f"in {event.get('region')} "
+            f"(risk hint: {event.get('risk_hint')})"
+        )
+        for event in suspicious_events
+    ]
 
-    now = _now()
+    if not findings:
+        findings.append("No suspicious IAM activity was detected.")
 
-    return RecommendationItem(
-        recommendation_id=f"sim_{uuid4().hex[:10]}",
-        resource_id=resource_id,
-        category=category,
-        title=title,
-        action=action,
-        rationale=rationale,
-        estimated_monthly_savings_usd=savings,
-        confidence="high",
-        state=RecommendationState.PENDING,
-        created_at=now,
-        updated_at=now,
+    actions = [
+        "Disable or rotate credentials for suspicious IAM principals.",
+        "Review CloudTrail events and investigate unfamiliar regions and IP addresses.",
+        "Inspect security group changes and newly created EC2 instances.",
+        "Enable MFA and enforce least-privilege IAM policies.",
+    ]
+
+    recommendations = [
+        {
+            "title": "Secure suspicious IAM credentials",
+            "action": "Disable or rotate credentials for suspicious principals.",
+            "category": "security",
+            "priority": "critical",
+        },
+        {
+            "title": "Review unauthorized infrastructure changes",
+            "action": "Investigate unexpected security group and EC2 changes.",
+            "category": "security",
+            "priority": "high",
+        },
+    ]
+
+    incident = SimulationIncident(
+        title="Potential IAM Security Breach",
+        risk_score=96 if suspicious_events else 10,
+        severity="critical" if suspicious_events else "low",
+        summary=(
+            f"Detected {len(suspicious_events)} suspicious CloudTrail events."
+            if suspicious_events
+            else "No suspicious IAM activity was detected."
+        ),
+        recommended_actions=actions if suspicious_events else [],
+    )
+
+    return SimulationResponse(
+        incident=incident,
+        findings=findings,
+        recommendations=recommendations if suspicious_events else [],
     )
 
 
-def _generate_iam_breach() -> tuple[
-    list[dict[str, Any]],
-    list[dict[str, Any]],
-    list[dict[str, Any]],
-    list[RecommendationItem],
-]:
-    """Generate signals and recommendations for a suspicious IAM breach."""
+def simulate_bot_traffic(provider: Any) -> SimulationResponse:
+    traffic_logs = provider.get_traffic_logs()
+    impact = summarize_traffic_impact(traffic_logs)
 
-    now = _now()
-    resource_id = "i-sim-iam-001"
-    region = "us-east-1"
-    principal = "suspicious-user"
+    total_requests = impact.get("total_requests", 0)
+    bot_share = impact.get("bot_share_pct", 0)
+    flagged_endpoints = impact.get("flagged_endpoints", [])
 
-    cloudtrail_events = [
-        {
-            "event_id": "sim_iam_001",
-            "timestamp": now.isoformat(),
-            "event_name": "ConsoleLogin",
-            "region": region,
-            "principal": principal,
-            "resource_id": resource_id,
-            "source_ip": "198.51.100.25",
-            "is_anomalous": True,
-            "risk_hint": 0.95,
-        },
-        {
-            "event_id": "sim_iam_002",
-            "timestamp": now.isoformat(),
-            "event_name": "RunInstances",
-            "region": region,
-            "principal": principal,
-            "resource_id": resource_id,
-            "source_ip": "198.51.100.25",
-            "is_anomalous": True,
-            "risk_hint": 0.90,
-        },
+    daily_cost = impact.get("estimated_daily_cost_impact_usd", 0)
+    monthly_cost = impact.get("estimated_monthly_cost_impact_usd", 0)
+
+    findings = [
+        f"Total requests analyzed: {total_requests:,}.",
+        f"Bot traffic represents {bot_share:.2f}% of total requests.",
+        f"Estimated daily cost impact: ${daily_cost:.2f}.",
+        f"Estimated monthly cost impact: ${monthly_cost:.2f}.",
     ]
 
-    metric_spikes = [
-        {
-            "event_id": "sim_iam_metric_001",
-            "timestamp": now.isoformat(),
-            "resource_id": resource_id,
-            "metric_name": "cpu_utilization",
-            "value": 96.0,
-            "baseline": 25.0,
-            "region": region,
-            "anomaly_score": 0.95,
-        }
-    ]
+    findings.extend(
+        f"Suspicious bot traffic detected on endpoint: {endpoint}."
+        for endpoint in flagged_endpoints
+    )
 
-    cost_deltas = [
-        {
-            "event_id": "sim_iam_cost_001",
-            "timestamp": now.isoformat(),
-            "service": "Amazon EC2",
-            "delta_usd": 180.0,
-            "baseline_usd": 100.0,
-            "delta_pct": 180.0,
-            "resource_id": resource_id,
-            "region": region,
-        }
+    actions = [
+        "Enable AWS WAF bot control rules.",
+        "Apply rate limiting to suspicious endpoints.",
+        "Block or challenge suspicious IP addresses and user agents.",
+        "Monitor authentication endpoints for credential-stuffing attacks.",
     ]
 
     recommendations = [
-        _recommendation(
-            resource_id,
-            RecommendationCategory.SECURITY,
-            "Investigate suspicious IAM activity",
-            "Revoke suspicious sessions, rotate exposed credentials, and review CloudTrail events.",
-            "An anomalous login was followed by an unexpected EC2 instance launch.",
-        ),
-        _recommendation(
-            resource_id,
-            RecommendationCategory.COST,
-            "Inspect unexpected EC2 resource usage",
-            "Verify the newly launched instance and terminate it if unauthorized.",
-            "Unexpected compute activity was correlated with increased CPU utilization and cost.",
-            180.0,
-        ),
-    ]
-
-    return cloudtrail_events, metric_spikes, cost_deltas, recommendations
-
-
-def _generate_bot_traffic() -> tuple[
-    list[dict[str, Any]],
-    list[dict[str, Any]],
-    list[dict[str, Any]],
-    list[RecommendationItem],
-]:
-    """Generate signals and recommendations for suspicious bot traffic."""
-
-    now = _now()
-    resource_id = "i-sim-web-001"
-    region = "us-east-1"
-
-    cloudtrail_events: list[dict[str, Any]] = []
-
-    metric_spikes = [
         {
-            "event_id": "sim_bot_metric_001",
-            "timestamp": now.isoformat(),
-            "resource_id": resource_id,
-            "metric_name": "request_count",
-            "value": 1500000.0,
-            "baseline": 50000.0,
-            "region": region,
-            "anomaly_score": 0.98,
-            "metadata": {
-                "endpoint": "/api/catalog/export",
-                "bot_share_pct": 96.4,
-            },
+            "title": "Mitigate automated bot traffic",
+            "action": "Configure AWS WAF and rate limiting for flagged endpoints.",
+            "category": "security",
+            "priority": "high",
         },
         {
-            "event_id": "sim_bot_metric_002",
-            "timestamp": now.isoformat(),
-            "resource_id": resource_id,
-            "metric_name": "network_out_bytes",
-            "value": 95000000000.0,
-            "baseline": 5000000000.0,
-            "region": region,
-            "anomaly_score": 0.92,
+            "title": "Reduce unnecessary network egress costs",
+            "action": "Investigate excessive automated requests and optimize responses.",
+            "category": "optimization",
+            "priority": "medium",
+            "estimated_monthly_savings_usd": round(monthly_cost, 2),
         },
     ]
 
-    cost_deltas = [
-        {
-            "event_id": "sim_bot_cost_001",
-            "timestamp": now.isoformat(),
-            "service": "Amazon CloudFront",
-            "delta_usd": 250.0,
-            "baseline_usd": 100.0,
-            "delta_pct": 250.0,
-            "resource_id": resource_id,
-            "region": region,
-        }
-    ]
-
-    recommendations = [
-        _recommendation(
-            resource_id,
-            RecommendationCategory.SECURITY,
-            "Block suspicious bot traffic",
-            "Configure AWS WAF rate-based rules and block abusive IP addresses.",
-            "Automated traffic accounts for a very high percentage of requests.",
+    incident = SimulationIncident(
+        title="Abnormal Bot Traffic Detected",
+        risk_score=92 if flagged_endpoints else 15,
+        severity="critical" if flagged_endpoints else "low",
+        summary=(
+            f"Bot traffic accounts for {bot_share:.2f}% of "
+            f"{total_requests:,} requests. "
+            f"{len(flagged_endpoints)} endpoints were flagged."
         ),
-        _recommendation(
-            resource_id,
-            RecommendationCategory.COST,
-            "Reduce bot-related infrastructure costs",
-            "Enable CDN caching and apply rate limits to expensive API endpoints.",
-            "Unusual request and network traffic caused a significant increase in service costs.",
-            250.0,
-        ),
-    ]
+        recommended_actions=actions if flagged_endpoints else [],
+    )
 
-    return cloudtrail_events, metric_spikes, cost_deltas, recommendations
+    return SimulationResponse(
+        incident=incident,
+        findings=findings,
+        recommendations=recommendations if flagged_endpoints else [],
+    )
 
 
-def _generate_resource_waste() -> tuple[
-    list[dict[str, Any]],
-    list[dict[str, Any]],
-    list[dict[str, Any]],
-    list[RecommendationItem],
-]:
-    """Generate signals and recommendations for underutilized resources."""
+def simulate_resource_waste(provider: Any) -> SimulationResponse:
+    resources = provider.get_resources()
+    metrics = provider.get_metrics(days=30)
 
-    now = _now()
-    resource_id = "i-sim-waste-001"
-    region = "us-east-1"
+    audit_findings = audit_resources(resources, metrics)
 
-    cloudtrail_events: list[dict[str, Any]] = []
-
-    metric_spikes = [
-        {
-            "event_id": "sim_waste_metric_001",
-            "timestamp": now.isoformat(),
-            "resource_id": resource_id,
-            "metric_name": "cpu_utilization",
-            "value": 7.0,
-            "baseline": 35.0,
-            "region": region,
-            "anomaly_score": 0.70,
-            "metadata": {
-                "condition": "underutilized",
-                "threshold_pct": 15.0,
-            },
-        }
-    ]
-
-    cost_deltas = [
-        {
-            "event_id": "sim_waste_cost_001",
-            "timestamp": now.isoformat(),
-            "service": "Amazon EC2",
-            "delta_usd": 168.0,
-            "baseline_usd": 0.0,
-            "delta_pct": 100.0,
-            "resource_id": resource_id,
-            "region": region,
-        }
-    ]
-
-    recommendations = [
-        _recommendation(
-            resource_id,
-            RecommendationCategory.COST,
-            "Right-size underutilized EC2 instance",
-            "Review instance sizing and move to a smaller instance type if workload requirements allow.",
-            "CPU utilization is below the 15% threshold while the instance continues to incur monthly costs.",
-            84.0,
+    findings = [
+        (
+            f"{item.get('description', item.get('issue', 'Resource issue'))} "
+            f"(Resource: {item.get('resource_id', 'unknown')})"
         )
+        for item in audit_findings
     ]
 
-    return cloudtrail_events, metric_spikes, cost_deltas, recommendations
+    recommendations = [
+        {
+            "title": f"Resolve {item.get('issue', 'resource issue')}",
+            "action": item.get("description", "Review this resource."),
+            "category": "optimization",
+            "priority": "high",
+            "resource_id": item.get("resource_id"),
+            "estimated_monthly_savings_usd": item.get(
+                "estimated_monthly_savings_usd", 0
+            ),
+        }
+        for item in audit_findings
+    ]
+
+    total_savings = sum(
+        float(item.get("estimated_monthly_savings_usd", 0))
+        for item in audit_findings
+    )
+
+    incident = SimulationIncident(
+        title="Cloud Resource Waste Detected",
+        risk_score=78 if audit_findings else 10,
+        severity="high" if audit_findings else "low",
+        summary=(
+            f"Detected {len(audit_findings)} resource issues. "
+            f"Potential monthly savings: ${total_savings:.2f}."
+        ),
+        recommended_actions=[
+            "Review and resize underutilized EC2 instances.",
+            "Remove unattached EBS volumes when they are no longer needed.",
+            "Enable or update backups for unprotected resources.",
+            "Review monthly resource costs and utilization.",
+        ] if audit_findings else [],
+    )
+
+    if not findings:
+        findings.append("No resource waste or backup issues were detected.")
+
+    return SimulationResponse(
+        incident=incident,
+        findings=findings,
+        recommendations=recommendations,
+    )
 
 
 @router.post("/simulate", response_model=SimulationResponse)
-def simulate_scenario(payload: SimulationRequest) -> SimulationResponse:
-    """Run a scenario and return generated signals, incident, and recommendations."""
+def simulate_scenario(request: SimulationRequest) -> SimulationResponse:
+    provider = get_telemetry_provider("mock")
 
-    generators = {
-        "iam_breach": _generate_iam_breach,
-        "bot_traffic": _generate_bot_traffic,
-        "resource_waste": _generate_resource_waste,
-    }
+    if request.scenario == "iam_breach":
+        return simulate_iam_breach(provider)
 
-    cloudtrail_events, metric_spikes, cost_deltas, recommendations = (
-        generators[payload.scenario]()
-    )
+    if request.scenario == "bot_traffic":
+        return simulate_bot_traffic(provider)
 
-    # Correlate the generated signals into incidents.
-    incidents = correlate_signals(
-        cloudtrail_events=cloudtrail_events,
-        metric_spikes=metric_spikes,
-        cost_deltas=cost_deltas,
-        time_window_minutes=60,
-        min_signals=2,
-    )
-
-    # Prepare a unified list of signals for the response.
-    signals: list[dict[str, Any]] = []
-
-    for event in cloudtrail_events:
-        signals.append({"signal_type": "cloudtrail", **event})
-
-    for metric in metric_spikes:
-        signals.append({"signal_type": "metric_spike", **metric})
-
-    for cost in cost_deltas:
-        signals.append({"signal_type": "cost_delta", **cost})
-
-    return SimulationResponse(
-        scenario=payload.scenario,
-        signals=signals,
-        incident=incidents[0] if incidents else None,
-        recommendations=recommendations,
-    )
+    return simulate_resource_waste(provider)

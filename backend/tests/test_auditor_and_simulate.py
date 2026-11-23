@@ -137,11 +137,26 @@ def test_simulate_iam_breach():
 
     data = response.json()
 
-    assert data["scenario"] == "iam_breach"
-    assert len(data["signals"]) > 0
-    assert data["incident"] is not None
-    assert data["incident"]["incident_type"] == "iam_compute_surge"
-    assert len(data["recommendations"]) == 2
+    assert set(data.keys()) == {
+        "incident",
+        "findings",
+        "recommendations",
+    }
+
+    assert isinstance(data["incident"], dict)
+    assert data["incident"]["title"] == "Potential IAM Security Breach"
+    assert isinstance(data["incident"]["risk_score"], int)
+    assert data["incident"]["severity"] == "critical"
+    assert isinstance(data["incident"]["summary"], str)
+    assert isinstance(data["incident"]["recommended_actions"], list)
+
+    assert isinstance(data["findings"], list)
+    assert len(data["findings"]) > 0
+    assert all(isinstance(item, str) for item in data["findings"])
+
+    assert isinstance(data["recommendations"], list)
+    assert len(data["recommendations"]) > 0
+    assert all(isinstance(item, dict) for item in data["recommendations"])
 
 
 def test_simulate_bot_traffic():
@@ -154,11 +169,26 @@ def test_simulate_bot_traffic():
 
     data = response.json()
 
-    assert data["scenario"] == "bot_traffic"
-    assert len(data["signals"]) > 0
-    assert data["incident"] is not None
-    assert data["incident"]["incident_type"] == "bot_traffic_cost_spike"
-    assert len(data["recommendations"]) == 2
+    assert set(data.keys()) == {
+        "incident",
+        "findings",
+        "recommendations",
+    }
+
+    assert isinstance(data["incident"], dict)
+    assert data["incident"]["title"] == "Abnormal Bot Traffic Detected"
+    assert isinstance(data["incident"]["risk_score"], int)
+    assert data["incident"]["severity"] == "critical"
+    assert isinstance(data["incident"]["summary"], str)
+    assert isinstance(data["incident"]["recommended_actions"], list)
+
+    assert isinstance(data["findings"], list)
+    assert len(data["findings"]) > 0
+    assert all(isinstance(item, str) for item in data["findings"])
+
+    assert isinstance(data["recommendations"], list)
+    assert len(data["recommendations"]) > 0
+    assert all(isinstance(item, dict) for item in data["recommendations"])
 
 
 def test_simulate_resource_waste():
@@ -171,11 +201,26 @@ def test_simulate_resource_waste():
 
     data = response.json()
 
-    assert data["scenario"] == "resource_waste"
-    assert len(data["signals"]) > 0
-    assert data["incident"] is not None
-    assert data["incident"]["incident_type"] == "cost_utilization_anomaly"
-    assert len(data["recommendations"]) == 1
+    assert set(data.keys()) == {
+        "incident",
+        "findings",
+        "recommendations",
+    }
+
+    assert isinstance(data["incident"], dict)
+    assert data["incident"]["title"] == "Cloud Resource Waste Detected"
+    assert isinstance(data["incident"]["risk_score"], int)
+    assert data["incident"]["severity"] == "high"
+    assert isinstance(data["incident"]["summary"], str)
+    assert isinstance(data["incident"]["recommended_actions"], list)
+
+    assert isinstance(data["findings"], list)
+    assert len(data["findings"]) > 0
+    assert all(isinstance(item, str) for item in data["findings"])
+
+    assert isinstance(data["recommendations"], list)
+    assert len(data["recommendations"]) > 0
+    assert all(isinstance(item, dict) for item in data["recommendations"])
 
 
 def test_simulate_invalid_scenario():
