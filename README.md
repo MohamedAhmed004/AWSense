@@ -1,51 +1,284 @@
-# AWSense
+# AWSense — Intelligent Cloud Management & Security Platform
 
-## Overview
-AWSense is an intelligent cloud management and security platform designed to continuously monitor, optimize, and secure AWS infrastructure. 
+[![FastAPI](https://img.shields.io/badge/FastAPI-0.115+-009688?logo=fastapi&logoColor=white)](https://fastapi.tiangolo.com)
+[![React](https://img.shields.io/badge/React-18.3-61DAFB?logo=react&logoColor=black)](https://react.dev)
+[![Vite](https://img.shields.io/badge/Vite-5.4-646CFF?logo=vite&logoColor=white)](https://vitejs.dev)
+[![Tailwind CSS](https://img.shields.io/badge/Tailwind-3.4-38B2AC?logo=tailwindcss&logoColor=white)](https://tailwindcss.com)
+[![Python](https://img.shields.io/badge/Python-3.10%20%7C%203.12-3776AB?logo=python&logoColor=white)](https://python.org)
+[![License](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
-The platform bridges the gap between cloud security posture management (CSPM) and cloud financial management (FinOps). By ingesting and correlating signals across multiple AWS services—such as resource configuration, user activity, network traffic, and billing—AWSense identifies inefficiencies, abnormal resource consumption, and potential security incidents.
+AWSense is an intelligent cloud management, security posture, and cost optimization platform designed to continuously monitor, correlate, and secure AWS infrastructure.
 
-## Problem Statement
-Modern AWS environments generate vast amounts of siloed telemetry. A CloudWatch alarm for high CPU, a CloudTrail event for an unusual IAM login, and a sudden spike in Cost Explorer may appear unrelated when analyzed independently. AWSense aggregates and correlates these events to provide actionable context, identifying complex scenarios such as compromised credentials resulting in unauthorized compute provisioning.
+The platform bridges the gap between Cloud Security Posture Management (**CSPM**) and Cloud Financial Management (**FinOps**). By correlating signals across multiple telemetry sources—such as resource configuration, IAM user activity, network traffic, and billing—AWSense detects anomalies, identifies root causes, calculates an explainable composite risk score, and delivers automated remediation recommendations.
+
+---
+
+## Architecture Overview
+
+AWSense is designed around a decoupled, four-tier architecture:
+
+```
+[ AWS APIs / Mock Generator ]
+             │
+             ▼
+[ Ingestion & Normalization Layer ] (boto3 / mock providers)
+             │
+             ▼
+[ Analytics & Intelligence Engine ] (IsolationForest, Correlator, 5-Factor Scorer, AI Explainer)
+             │
+             ▼
+[ Backend REST API & DB Layer ]     (FastAPI, SQLAlchemy ORM, SQLite / PostgreSQL)
+             │
+             ▼
+[ Frontend Presentation Layer ]    (Vite, React 18, Tailwind CSS, Recharts, Schema Adapters)
+```
+
+For complete architectural specifications, UML diagrams, entity relationships, and mathematical methodologies, see:
+📖 **[docs/system-analysis-and-design.md](docs/system-analysis-and-design.md)**
+
+---
 
 ## Core Capabilities
-1. **Resource Optimization:** Continuous evaluation of EC2, EBS, S3, and RDS to identify underutilized instances, unattached storage, and over-provisioned infrastructure.
-2. **Behavioral Anomaly Detection:** Establishes behavioral baselines for IAM principals and AWS resources. Evaluates deviations using statistical analysis and machine learning.
-3. **Automated Traffic Analysis:** Analyzes network and application traffic patterns to identify automated bots or scrapers impacting infrastructure costs.
-4. **Intelligent Event Correlation:** Cross-references security, performance, and billing telemetry to build unified incident narratives.
-5. **Contextual Risk Scoring:** Aggregates individual anomalies into a unified risk score based on resource criticality, cost impact, and behavioral deviation.
 
-## System Architecture
+1. **Multi-Signal Correlation Engine (`correlator.py`):** Automatically associates related CloudTrail audit events, CloudWatch metric spikes, and Cost Explorer billing jumps within configurable time windows (60 min) by resource ID, IAM principal, or AWS region.
+2. **Machine Learning Anomaly Detection (`ml_detector.py`):** Unsupervised multivariate `IsolationForest` pipeline trained on `cpu_utilization`, `network_in_bytes`, `network_out_bytes`, and `request_count`, with `log1p` logarithmic compression and calibrated sigmoid anomaly scoring (`0.0–1.0`).
+3. **Contextual 5-Factor Risk Scoring (`risk_scorer.py`):** Computes an explainable `0–100` composite risk score based on ML confidence (30%), IAM security risk (25%), resource impact (20%), cost delta impact (15%), and traffic anomaly spikes (10%).
+4. **Cloud Hygiene & Cost Auditing (`auditor.py`):** Automatically flags underutilized EC2 instances (<15% CPU), identifies unattached EBS storage volumes, and detects backup gaps (missing or stale recovery points) across RDS and S3.
+5. **Generative AI Incident Explanations (`ai_explainer.py`):** Produces plain-English incident narratives and actionable, numbered remediation checklists via OpenAI GPT or Google Gemini, with robust deterministic fallback synthesis.
+6. **Live Threat Simulation Drawer (`SimulatePanel.jsx`):** On-demand simulation of realistic enterprise incident scenarios (**IAM Credential Breach**, **Automated Bot Traffic**, and **Resource Waste**) in both offline mock mode and live backend persistence mode.
+7. **Interactive Dashboard & Sanitized CSV Export:** Client-side sorting, "Backup Gaps Only" toggle, dynamic KPI metrics, and formula-injection-safe CSV export (`\uFEFF` UTF-8 BOM, `= + - @ \t \r` prefix protection).
 
-The AWSense architecture is designed around a decoupled data ingestion and analysis pipeline.
+---
 
-### 1. Data Ingestion Layer
-- **AWS API Integration:** Uses `boto3` to interact with AWS services via a cross-account IAM role with strict read-only permissions.
-- **Log Aggregation:** Pulls event data from CloudTrail, CloudWatch Metrics/Logs, and Cost Explorer.
-- **Mock Data Engine:** (Pre-production) A local data generator simulating AWS telemetry for local development and ML model training prior to sandbox access.
+## Live Repository Structure
 
-### 2. Processing & Storage Layer
-- **Relational Data (PostgreSQL):** Stores application state, user configurations, resource inventories, and historical baselines.
-- **Time-Series / Document Data (Elasticsearch / MongoDB):** Handles high-volume event logs, traffic data, and raw CloudTrail events.
-- **Correlation Engine:** A Python-based microservice that evaluates incoming telemetry against defined rulesets and historical baselines.
+```
+AWSense/
+├── backend/
+│   ├── app/
+│   │   ├── api/                  # FastAPI routers
+│   │   │   ├── alerts.py         # /api/v1/alerts endpoints & lifecycle status
+│   │   │   ├── overview.py       # /api/v1/overview KPIs & historical trends
+│   │   │   ├── recommendations.py# /api/v1/recommendations & action approval
+│   │   │   ├── resources.py      # /api/v1/resources & inventory filtering
+│   │   │   ├── simulate.py       # /api/v1/simulate incident scenario engine
+│   │   │   └── traffic.py        # /api/v1/traffic analytics & endpoint patterns
+│   │   ├── core/
+│   │   │   └── database.py       # SQLAlchemy engine, session factory, pragmas
+│   │   ├── models/
+│   │   │   └── entities.py       # ORM entities (CloudResource, TelemetryMetric, etc.)
+│   │   ├── services/
+│   │   │   ├── ai_explainer.py   # LLM incident synthesis (OpenAI/Gemini/fallback)
+│   │   │   ├── auditor.py        # Resource rightsizing and egress attribution
+│   │   │   ├── correlator.py     # Pure-Python time-window correlation engine
+│   │   │   ├── ml_detector.py    # IsolationForest anomaly detector pipeline
+│   │   │   ├── mock_generator.py # Deterministic synthetic AWS telemetry fixtures
+│   │   │   ├── repository.py     # Database CRUD and idempotent seeder
+│   │   │   ├── risk_scorer.py    # 5-factor composite mathematical scoring formula
+│   │   │   └── telemetry_provider.py # Provider abstraction (Mock & Boto3)
+│   │   └── main.py               # FastAPI application startup, CORS, and routers
+│   ├── tests/                    # Comprehensive Pytest test suites (42 tests)
+│   ├── requirements.txt          # Python dependencies
+│   ├── pytest.ini                # Pytest configuration
+│   └── .env.example              # Backend environment template
+├── frontend/
+│   ├── src/
+│   │   ├── components/
+│   │   │   ├── Layout.jsx        # Navigation shell, header, Refresh & Simulate buttons
+│   │   │   ├── SimulatePanel.jsx # Self-contained accessible incident simulation drawer
+│   │   │   └── ui.jsx            # Design system tokens, Card, Pill, SeverityBadge
+│   │   ├── pages/
+│   │   │   ├── Overview.jsx      # High-level KPIs, health score, cost trend chart
+│   │   │   ├── Recommendations.jsx # Optimization playbooks & approval workflow
+│   │   │   ├── Resources.jsx     # Inventory table, Backup Gaps toggle, CSV export
+│   │   │   ├── Security.jsx      # Correlated alert feed, breakdown bars, action steps
+│   │   │   └── Traffic.jsx       # Egress trends, bot share %, endpoint patterns
+│   │   ├── services/
+│   │   │   ├── adapters.js       # Backend-to-UI schema mapper functions
+│   │   │   ├── adapters.test.mjs # Unit tests for frontend adapters
+│   │   │   └── api.js            # Unified API service with mock/live toggling
+│   │   ├── App.jsx               # React Router configuration
+│   │   └── main.jsx              # React application entrypoint
+│   ├── package.json              # Node.js dependencies and scripts
+│   ├── tailwind.config.js        # Design system palette (ink, panel, raised, crit...)
+│   ├── vite.config.js            # Vite build configuration
+│   └── .env.example              # Frontend environment template
+└── docs/
+    ├── system-analysis-and-design.md # Full engineering analysis & Mermaid diagrams
+    ├── architecture-and-codebase.md  # Deep-dive codebase technical reference
+    └── api-contract.json             # REST API payload contracts
+```
 
-### 3. Machine Learning & Analytics Engine
-- **Anomaly Detection:** Utilizes Scikit-learn (e.g., Isolation Forests, K-Means clustering) to detect deviations in time-series metrics (CPU, Network In/Out) and API call frequencies.
-- **AI Analysis:** Integrates with an LLM backend to parse correlated incidents and generate human-readable explanations and remediation steps.
+---
 
-### 4. Presentation Layer
-- **Frontend Application:** A React-based Single Page Application (Next.js/Vite) providing the primary user interface.
-- **Dashboard Interfaces:** Displays global risk scores, cost-saving opportunities, and granular security alerts through a unified control plane.
+## Local Setup & Quick Start Runbook
 
-## Development Workflow (Pre-AWS Sandbox)
+### Prerequisites
+- **Python:** 3.10 or 3.12+ (64-bit)
+- **Node.js:** 18.x or 20.x+
+- **Package Managers:** `pip` and `npm` (v9+)
 
-While awaiting provisioning of the AWS testing sandbox, development is structured around the following parallel tracks:
+---
 
-1. **Mock Data Generation (Backend):** Developing Python generators to output realistic JSON structures mirroring AWS CloudTrail, CloudWatch, and Billing APIs.
-2. **Frontend Implementation:** Building out the dashboard UI components and state management using the mock data schemas.
-3. **Database Schema Design:** Normalizing the relational schema for resources and establishing the indexing strategy for event data.
-4. **ML Prototyping:** Training baseline anomaly detection models using the synthesized AWS data.
+### 1. Backend Setup & Runbook
 
-## Getting Started
+#### Step 1: Create and Activate Virtual Environment
+Open a terminal in the project root:
 
-*(Setup instructions for the local environment, database containers, and the frontend/backend servers will be documented here.)*
+```bash
+# Navigate to the backend directory
+cd backend
+
+# Create virtual environment
+python -m venv .venv
+
+# Activate virtual environment
+# Windows (PowerShell):
+.venv\Scripts\Activate.ps1
+# Windows (CMD):
+.venv\Scripts\activate.bat
+# Linux / macOS:
+source .venv/bin/activate
+```
+
+#### Step 2: Install Dependencies
+```bash
+python -m pip install --upgrade pip
+pip install -r requirements.txt
+```
+
+#### Step 3: Configure Environment Variables
+Create a local `.env` file from the template:
+
+```bash
+cp .env.example .env
+```
+
+Contents of `backend/.env`:
+```env
+# Database connection string (defaults to local SQLite when unset)
+DATABASE_URL=sqlite:///./awsense.db
+
+# Enable SQL statement logging (true | false)
+SQL_ECHO=false
+
+# Optional: LLM enrichment keys (falls back to deterministic templates if omitted)
+# OPENAI_API_KEY=sk-...
+# GEMINI_API_KEY=AIzaSy...
+```
+
+#### Step 4: Database Initialization
+AWSense initializes and seeds the database automatically on startup via the FastAPI lifespan hook (`app/main.py`).
+
+To manually initialize and seed the database ahead of time:
+```bash
+python -c "from app.core import database; from app.services.repository import seed_database; database.create_tables(); s = database.SessionLocal(); seed_database(s); s.close(); print('Database initialized and seeded.')"
+```
+
+#### Step 5: Run the Backend Test Suite
+Verify that all 42 unit and integration tests pass:
+```bash
+pytest -v
+```
+
+#### Step 6: Start the FastAPI Backend Server
+Run the ASGI server with hot-reload enabled:
+```bash
+uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+```
+
+- **API Base URL:** `http://localhost:8000`
+- **Interactive OpenAPI Docs:** `http://localhost:8000/docs`
+- **API Health Check:** `http://localhost:8000/api/v1/health`
+
+---
+
+### 2. Frontend Setup & Runbook
+
+#### Step 1: Install Dependencies
+Open a second terminal window and navigate to `frontend`:
+
+```bash
+cd frontend
+
+# Clean install using package-lock.json
+npm ci
+# Or standard install:
+npm install
+```
+
+#### Step 2: Configure Environment Variables
+Copy `.env.example` to `.env`:
+
+```bash
+cp .env.example .env
+```
+
+Environment options:
+- **Sample Data Mode (Offline / Mock):**
+  ```env
+  VITE_USE_MOCK=true
+  VITE_API_URL=http://localhost:8000/api/v1
+  ```
+  Runs instantly using local fixtures from `src/mock/`. No backend or database required.
+
+- **Live Backend Mode:**
+  ```env
+  VITE_USE_MOCK=false
+  VITE_API_URL=http://localhost:8000/api/v1
+  ```
+  Connects directly to the FastAPI server and passes responses through `src/services/adapters.js`.
+
+#### Step 3: Run Frontend Adapter Tests
+```bash
+node --test src/services/adapters.test.mjs
+```
+
+#### Step 4: Start the Development Server
+```bash
+npm run dev
+```
+Open your browser to: **`http://localhost:5173/`**
+
+#### Step 5: Build for Production
+```bash
+npm run build
+```
+Generates production assets in `frontend/dist/`.
+
+---
+
+## Interactive Features & Verification Runbook
+
+### 1. Incident Simulation Drawer
+- Click the **"Simulate Incident"** button (Zap icon) in the top-right header.
+- The drawer dialog opens with a dimmed backdrop and full keyboard accessibility (Esc closes, Tab is trapped).
+- Choose one of three scenarios:
+  - **IAM Breach:** Unfamiliar region login, unauthorized EC2 instances launched, security group opened to `0.0.0.0/0`. (Score: 94 Critical).
+  - **Bot Traffic:** 96x HTTP request flood on `/api/products` driving CPU utilization past 85%. (Score: 78 High).
+  - **Resource Waste:** Idle worker instances averaging 7% CPU, unattached EBS storage, cold logs in S3. (Score: 41 Medium).
+- Click **"Run simulation"**:
+  - In mock mode (`VITE_USE_MOCK=true`): Renders instant preview.
+  - In live mode (`VITE_USE_MOCK=false`): Dispatches `POST /api/v1/simulate` to the FastAPI backend, persisting the incident to the database.
+
+### 2. Resource Inventory & CSV Export (`/resources`)
+- **Resource Inventory:** Displays all tracked compute, storage, and database resources with CPU utilization gauges and backup badges.
+- **Backup Gaps Only Toggle:** Click **"Backup Gaps Only"** (`ShieldAlert` icon) to instantly isolate resources marked as `missing` or `stale` (4 items).
+- **Export CSV Button:** Click **"Export CSV"** (`Download` icon) to export the filtered rows to `awsense-resources-YYYY-MM-DD.csv`. The output includes a UTF-8 BOM, quotes special characters, and sanitizes spreadsheet formula injection.
+- **Refresh Control:** Click **"Refresh"** (`RefreshCw` icon) in the header to re-fetch and remount active view data cleanly.
+
+---
+
+## Testing & Quality Assurance Summary
+
+| Test Command | Scope | Target | Result |
+| :--- | :--- | :--- | :---: |
+| `pytest backend/tests -v` | Backend Unit & Integration Tests | Database, ORM, ML, Correlator, API, Simulate, Repository | **42 / 42 PASSED** |
+| `node --test frontend/src/services/adapters.test.mjs` | Frontend Adapter Tests | Overview, Resources, Alerts, Traffic, Recommendations schema mappers | **6 / 6 PASSED** |
+| `npm run build --prefix frontend` | Production Bundle Compilation | Vite React compilation, PostCSS, Tailwind CSS | **PASSED (0 errors)** |
+
+---
+
+## License
+
+This project is licensed under the MIT License.

@@ -1,3 +1,4 @@
+"""Optimization, security, and backup recommendation endpoints."""
 
 from __future__ import annotations
 
@@ -49,7 +50,7 @@ class RecommendationsResponse(BaseModel):
 class RecommendationActionRequest(BaseModel):
     """State transition payload."""
 
-    action: Literal["approved", "dismissed"]
+    action: Literal["pending", "approved", "dismissed"]
 
 
 class RecommendationActionResponse(BaseModel):
@@ -155,9 +156,7 @@ def _datetime_sort_key(value: datetime) -> float:
     return value.timestamp()
 
 
-def _convert_db_recommendation(
-    recommendation: Recommendation,
-) -> RecommendationItem:
+def _to_item(recommendation: Recommendation) -> RecommendationItem:
     """Convert a SQLAlchemy Recommendation into the API response schema."""
 
     return RecommendationItem(
@@ -184,16 +183,14 @@ def get_recommendations(
     state: RecommendationState | None = Query(default=None),
     db: Session = Depends(get_db),
 ) -> RecommendationsResponse:
-    """List sample and database recommendations."""
+    """List sample and database recommendations with optional filters."""
 
-    # Keep existing seed recommendations.
     recommendations_by_id = {
         item.recommendation_id: item.model_copy(deep=True)
         for item in _RECOMMENDATIONS_STORE.values()
     }
 
     # Depends is not resolved when the function is called directly.
-    # Only query SQLite when a real SQLAlchemy Session is available.
     if isinstance(db, Session):
         database_recommendations = list_recommendations(db)
     else:
@@ -201,7 +198,7 @@ def get_recommendations(
 
     # Database records override seed records with the same ID.
     for recommendation in database_recommendations:
-        item = _convert_db_recommendation(recommendation)
+        item = _to_item(recommendation)
         recommendations_by_id[item.recommendation_id] = item
 
     items = [
@@ -211,8 +208,7 @@ def get_recommendations(
         and (state is None or item.state == state)
     ]
 
-    # Sort safely when SQLite returns naive datetimes
-    # and seed recommendations contain timezone-aware datetimes.
+    # Handle both timezone-aware seed dates and naive SQLite dates.
     items.sort(
         key=lambda item: (
             _datetime_sort_key(item.created_at),
@@ -250,7 +246,7 @@ def act_on_recommendation(
 
     new_state = RecommendationState(payload.action)
 
-    # Query the database only when a real Session is available.
+    # Query the database only when a real SQLAlchemy Session is available.
     existing_db_record = (
         db.get(Recommendation, recommendation_id)
         if isinstance(db, Session)
@@ -266,7 +262,7 @@ def act_on_recommendation(
             new_state,
         )
 
-        updated_item = _convert_db_recommendation(updated_record)
+        updated_item = _to_item(updated_record)
 
     else:
         # Preserve support for the original in-memory seed recommendations.

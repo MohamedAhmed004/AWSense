@@ -1,4 +1,12 @@
 import * as mock from '../mock'
+import {
+  adaptAlerts,
+  adaptOverview,
+  adaptRecommendationAction,
+  adaptRecommendations,
+  adaptResources,
+  adaptTraffic,
+} from './adapters.js'
 
 // Flip VITE_USE_MOCK=false in .env to call the FastAPI backend
 const USE_MOCK = (import.meta.env.VITE_USE_MOCK ?? 'true') !== 'false'
@@ -16,15 +24,22 @@ async function http(path, options = {}) {
   return res.json()
 }
 
-export const getOverview = () => (USE_MOCK ? local(mock.overview) : http('/overview'))
-export const getResources = () => (USE_MOCK ? local(mock.resources) : http('/resources'))
-export const getAlerts = () => (USE_MOCK ? local(mock.alerts) : http('/alerts'))
-export const getTraffic = () => (USE_MOCK ? local(mock.traffic) : http('/traffic'))
+export const getOverview = () =>
+  USE_MOCK ? local(mock.overview) : http('/overview').then(adaptOverview)
+export const getResources = () =>
+  USE_MOCK ? local(mock.resources) : http('/resources').then(adaptResources)
+export const getAlerts = () =>
+  USE_MOCK ? local(mock.alerts) : http('/alerts').then(adaptAlerts)
+export const getTraffic = () =>
+  USE_MOCK ? local(mock.traffic) : http('/traffic').then(adaptTraffic)
 export const getRecommendations = () =>
-  USE_MOCK ? local(mock.recommendations) : http('/recommendations')
+  USE_MOCK ? local(mock.recommendations) : http('/recommendations').then(adaptRecommendations)
 
-// action: 'approved' | 'dismissed'
+// action: 'pending' | 'approved' | 'dismissed'
 export const actOnRecommendation = (id, action) =>
   USE_MOCK
     ? local({ id, state: action })
-    : http(`/recommendations/${id}/action`, { method: 'POST', body: JSON.stringify({ action }) })
+    : http(`/recommendations/${id}/action`, {
+        method: 'POST',
+        body: JSON.stringify({ action }),
+      }).then(adaptRecommendationAction)

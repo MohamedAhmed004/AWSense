@@ -1,7 +1,8 @@
-
-"""Overview dashboard summary endpoint."""
+"""Overview dashboard summary endpoint computed from DB state and telemetry."""
 
 from __future__ import annotations
+
+from collections import defaultdict
 
 from fastapi import APIRouter, Depends
 from pydantic import BaseModel, Field
@@ -17,7 +18,9 @@ from app.models.entities import (
     Recommendation,
     RecommendationState,
     SecurityAlert,
+    TelemetryMetric,
 )
+from app.services.telemetry_provider import get_telemetry_provider
 
 router = APIRouter(prefix="/api/v1", tags=["overview"])
 
@@ -48,7 +51,6 @@ class OverviewResponse(BaseModel):
     cost_usage_trend: list[CostUsagePoint]
 
 
-# The trend remains sample data until telemetry aggregation is connected.
 _SAMPLE_COST_USAGE_TREND = [
     CostUsagePoint(
         date="2026-11-15",
@@ -94,8 +96,6 @@ _SAMPLE_COST_USAGE_TREND = [
     ),
 ]
 
-
-# Temporary fallback values for direct calls and empty cost data.
 _SAMPLE_MONTHLY_SPEND = 1842.75
 
 _SEVERITY_RANK = {
@@ -107,7 +107,7 @@ _SEVERITY_RANK = {
 
 
 def _build_sample_overview() -> OverviewResponse:
-    """Build sample overview for direct function calls without a DB session."""
+    """Build sample overview for direct calls without a DB session."""
 
     return OverviewResponse(
         health_score=64.0,
@@ -127,20 +127,67 @@ def _build_sample_overview() -> OverviewResponse:
     )
 
 
+def _build_trend_series(db: Session) -> list[CostUsagePoint]:
+    """Combine daily provider costs with DB telemetry metrics."""
+
+    provider = get_telemetry_provider()
+    cost_rows = provider.get_cost_usage(days=30)
+
+    daily_cost: dict[str, float] = defaultdict(float)
+
+    for entry in cost_rows:
+        timestamp = entry.get("timestamp", "")
+        day = str(entry.get("date") or timestamp[:10])
+
+        if day:
+            daily_cost[day] += float(entry.get("cost_usd", 0.0))
+
+    daily_cpu: dict[str, list[float]] = defaultdict(list)
+    daily_requests: dict[str, int] = defaultdict(int)
+
+    metric_rows = list(db.scalars(select(TelemetryMetric)).all())
+
+    for metric in metric_rows:
+        day = metric.timestamp.strftime("%Y-%m-%d")
+        daily_cpu[day].append(float(metric.cpu_utilization))
+        daily_requests[day] += int(metric.request_count)
+
+    all_days = sorted(set(daily_cost) | set(daily_cpu))
+
+    trend = []
+
+    for day in all_days:
+        cpu_values = daily_cpu.get(day, [])
+
+        avg_cpu = (
+            round(sum(cpu_values) / len(cpu_values), 1)
+            if cpu_values
+            else 0.0
+        )
+
+        trend.append(
+            CostUsagePoint(
+                date=day,
+                daily_cost_usd=round(daily_cost.get(day, 0.0), 2),
+                avg_cpu_pct=avg_cpu,
+                request_count=daily_requests.get(day, 0),
+            )
+        )
+
+    return trend or _SAMPLE_COST_USAGE_TREND
+
+
 @router.get("/overview", response_model=OverviewResponse)
 def get_overview(
     db: Session = Depends(get_db),
 ) -> OverviewResponse:
     """Return dashboard overview calculated from persisted database records."""
 
-    # When called directly (outside FastAPI), Depends is not resolved.
-    # Return sample data to keep direct function tests compatible.
+    # Depends is not resolved when this function is called directly.
     if not isinstance(db, Session):
         return _build_sample_overview()
 
-    resources = list(
-        db.scalars(select(CloudResource)).all()
-    )
+    resources = list(db.scalars(select(CloudResource)).all())
 
     alerts = list(
         db.scalars(
@@ -156,28 +203,20 @@ def get_overview(
         db.scalars(select(Recommendation)).all()
     )
 
-    # Active alerts by severity.
     critical_count = sum(
-        1
-        for alert in alerts
+        1 for alert in alerts
         if alert.severity == AlertSeverity.CRITICAL
     )
-
     high_count = sum(
-        1
-        for alert in alerts
+        1 for alert in alerts
         if alert.severity == AlertSeverity.HIGH
     )
-
     medium_count = sum(
-        1
-        for alert in alerts
+        1 for alert in alerts
         if alert.severity == AlertSeverity.MEDIUM
     )
-
     low_count = sum(
-        1
-        for alert in alerts
+        1 for alert in alerts
         if alert.severity == AlertSeverity.LOW
     )
 
@@ -189,7 +228,6 @@ def get_overview(
         low=low_count,
     )
 
-    # Highest severity among active alerts.
     if alerts:
         highest_severity = max(
             (alert.severity for alert in alerts),
@@ -198,7 +236,6 @@ def get_overview(
     else:
         highest_severity = AlertSeverity.LOW
 
-    # Calculate health score from the highest active alert risk.
     highest_risk_score = max(
         (float(alert.risk_score) for alert in alerts),
         default=0.0,
@@ -209,7 +246,6 @@ def get_overview(
         1,
     )
 
-    # Monthly savings from non-dismissed recommendations.
     total_savings = round(
         sum(
             float(item.estimated_monthly_savings_usd or 0.0)
@@ -219,7 +255,6 @@ def get_overview(
         2,
     )
 
-    # Total monthly cost of monitored resources.
     monthly_spend = round(
         sum(
             float(resource.monthly_cost_usd or 0.0)
@@ -228,11 +263,9 @@ def get_overview(
         2,
     )
 
-    # Use sample spend only when the database has no usable cost data.
     if monthly_spend <= 0:
         monthly_spend = _SAMPLE_MONTHLY_SPEND
 
-    # Count resources that need backup protection.
     unprotected_resources = sum(
         1
         for resource in resources
@@ -250,5 +283,5 @@ def get_overview(
         active_alerts=active_alerts,
         monitored_resources=len(resources),
         unprotected_resources=unprotected_resources,
-        cost_usage_trend=_SAMPLE_COST_USAGE_TREND,
+        cost_usage_trend=_build_trend_series(db),
     )
