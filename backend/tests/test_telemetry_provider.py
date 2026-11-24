@@ -13,6 +13,9 @@ BACKEND_DIR = Path(__file__).resolve().parents[1]
 if str(BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(BACKEND_DIR))
 
+import boto3
+from botocore.stub import Stubber
+
 from app.services.correlator import correlate_signals  # noqa: E402
 from app.services.mock_generator import MockTelemetryProvider  # noqa: E402
 from app.services.telemetry_provider import (  # noqa: E402
@@ -22,8 +25,8 @@ from app.services.telemetry_provider import (  # noqa: E402
 )
 
 
-def test_provider_factory_and_boto3_stub(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Factory switches between mock and aws providers, and boto3 stub raises NotImplementedError."""
+def test_provider_factory_and_boto3_provider_ready(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Factory switches between mock and aws providers, and boto3 collectors degrade cleanly."""
     monkeypatch.delenv("DATA_SOURCE", raising=False)
     default_provider = get_telemetry_provider()
     assert isinstance(default_provider, TelemetryProvider)
@@ -32,15 +35,38 @@ def test_provider_factory_and_boto3_stub(monkeypatch: pytest.MonkeyPatch) -> Non
     monkeypatch.setenv("DATA_SOURCE", "aws")
     aws_provider = get_telemetry_provider()
     assert isinstance(aws_provider, Boto3TelemetryProvider)
-    for method_call in (
-        aws_provider.get_resources,
-        aws_provider.get_metrics,
-        aws_provider.get_cloudtrail_events,
-        aws_provider.get_traffic_logs,
-        aws_provider.get_cost_usage,
+
+    session = boto3.Session(
+        aws_access_key_id="test",
+        aws_secret_access_key="test",
+        region_name="us-east-1",
+    )
+    clients = {}
+    stubbers = []
+    for svc, ops in (
+        ("ec2", ["describe_instances", "describe_volumes", "describe_instances"]),
+        ("rds", ["describe_db_instances"]),
+        ("s3", ["list_buckets"]),
+        ("cloudwatch", ["list_metrics"]),
+        ("cloudtrail", ["lookup_events"]),
+        ("ce", ["get_cost_and_usage"]),
     ):
-        with pytest.raises(NotImplementedError):
-            method_call()
+        client = session.client(svc, region_name="us-east-1")
+        stubber = Stubber(client)
+        for op in ops:
+            stubber.add_client_error(op, service_error_code="AccessDeniedException")
+        stubber.activate()
+        clients[svc] = client
+        stubbers.append(stubber)
+
+    stubbed_aws = Boto3TelemetryProvider(region_name="us-east-1", session=session, clients=clients)
+    assert stubbed_aws.get_resources() == []
+    assert stubbed_aws.get_metrics() == []
+    assert stubbed_aws.get_cloudtrail_events() == []
+    assert stubbed_aws.get_traffic_logs() == []
+    assert stubbed_aws.get_cost_usage() == []
+    for stubber in stubbers:
+        stubber.assert_no_pending_responses()
 
     with pytest.raises(ValueError):
         get_telemetry_provider("invalid_source")
