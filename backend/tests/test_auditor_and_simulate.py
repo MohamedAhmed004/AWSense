@@ -1,8 +1,14 @@
 
+import pytest
+
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
+from sqlalchemy import select
+from sqlalchemy.orm import sessionmaker
 
 from app.api.simulate import router
+from app.core.database import Base, build_engine, get_db
+from app.models.entities import CloudResource, Recommendation, SecurityAlert
 from app.services.auditor import (
     audit_resources,
     summarize_traffic_impact,
@@ -14,6 +20,38 @@ app = FastAPI()
 app.include_router(router)
 
 client = TestClient(app)
+
+
+@pytest.fixture(autouse=True)
+def isolated_database(tmp_path, monkeypatch):
+    """Give every test an isolated SQLite database."""
+    test_engine = build_engine(f"sqlite:///{tmp_path / 'test.db'}")
+    Base.metadata.create_all(bind=test_engine)
+
+    TestSessionLocal = sessionmaker(
+        autocommit=False,
+        autoflush=False,
+        bind=test_engine,
+    )
+
+    def override_get_db():
+        db = TestSessionLocal()
+        try:
+            yield db
+        finally:
+            db.close()
+
+    app.dependency_overrides[get_db] = override_get_db
+
+    # Keep AI explanations deterministic and prevent external API calls.
+    monkeypatch.setenv("OPENAI_API_KEY", "")
+    monkeypatch.setenv("LLM_API_KEY", "")
+    monkeypatch.setenv("GEMINI_API_KEY", "")
+
+    yield TestSessionLocal
+
+    app.dependency_overrides.clear()
+    test_engine.dispose()
 
 
 # -------------------------
@@ -221,6 +259,60 @@ def test_simulate_resource_waste():
     assert isinstance(data["recommendations"], list)
     assert len(data["recommendations"]) > 0
     assert all(isinstance(item, dict) for item in data["recommendations"])
+
+
+@pytest.mark.parametrize(
+    ("scenario", "expected_resource_id"),
+    [
+        ("iam_breach", "i-sim-iam-001"),
+        ("bot_traffic", "i-sim-web-001"),
+        ("resource_waste", "i-sim-waste-001"),
+    ],
+)
+def test_simulation_persists_alert_and_recommendations(
+    isolated_database,
+    scenario,
+    expected_resource_id,
+):
+    response = client.post(
+        "/api/v1/simulate",
+        json={"scenario": scenario},
+    )
+
+    assert response.status_code == 200
+    response_data = response.json()
+
+    with isolated_database() as db:
+        resource = db.get(CloudResource, expected_resource_id)
+        assert resource is not None
+        assert resource.metadata_json["simulated"] is True
+
+        alert = db.scalar(
+            select(SecurityAlert).where(
+                SecurityAlert.alert_id == f"sim_alert_{scenario}"
+            )
+        )
+
+        assert alert is not None
+        assert alert.resource_id == expected_resource_id
+        assert alert.title == response_data["incident"]["title"]
+        assert alert.ai_summary == response_data["incident"]["summary"]
+        assert alert.recommended_actions == response_data["incident"]["recommended_actions"]
+
+        recommendations = list(
+            db.scalars(
+                select(Recommendation).where(
+                    Recommendation.resource_id == expected_resource_id
+                )
+            ).all()
+        )
+
+        assert len(recommendations) == len(response_data["recommendations"])
+        assert len(recommendations) > 0
+        assert all(
+            recommendation.recommendation_id.startswith("sim_")
+            for recommendation in recommendations
+        )
 
 
 def test_simulate_invalid_scenario():

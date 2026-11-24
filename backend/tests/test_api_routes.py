@@ -1,3 +1,4 @@
+
 """FastAPI TestClient tests for all AWSense Task 3 API routers."""
 
 from __future__ import annotations
@@ -8,6 +9,7 @@ from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
+from sqlalchemy.orm import sessionmaker
 
 # Allow running directly from repo root or backend/.
 BACKEND_DIR = Path(__file__).resolve().parents[1]
@@ -15,7 +17,16 @@ if str(BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(BACKEND_DIR))
 
 from app.api.recommendations import reset_recommendations_state  # noqa: E402
+from app.core.database import build_engine, create_tables, get_db  # noqa: E402
 from app.main import app  # noqa: E402
+from app.models.entities import (  # noqa: E402
+    BackupStatus,
+    CloudResource,
+    Recommendation,
+    RecommendationCategory,
+    RecommendationState,
+    ResourceType,
+)
 
 
 @pytest.fixture(autouse=True)
@@ -27,9 +38,70 @@ def _reset_recommendations() -> Generator[None, None, None]:
 
 
 @pytest.fixture
-def client() -> TestClient:
-    """Return a FastAPI TestClient wired to the main app."""
-    return TestClient(app)
+def client(tmp_path: Path) -> Generator[TestClient, None, None]:
+    """Return a TestClient using an isolated temporary SQLite database."""
+
+    # Create a separate database for this test.
+    db_file = tmp_path / "test_api_routes.db"
+    test_engine = build_engine(f"sqlite:///{db_file.as_posix()}")
+
+    create_tables(test_engine)
+
+    TestSessionLocal = sessionmaker(
+        autocommit=False,
+        autoflush=False,
+        bind=test_engine,
+    )
+
+    # Add minimal data required by the overview and recommendations APIs.
+    with TestSessionLocal() as session:
+        resource = CloudResource(
+            resource_id="test-api-resource",
+            name="API Test Resource",
+            resource_type=ResourceType.EC2,
+            region="us-east-1",
+            status="running",
+            utilization_pct=35.0,
+            backup_status=BackupStatus.PROTECTED,
+            monthly_cost_usd=100.0,
+        )
+
+        session.add(resource)
+        session.flush()
+
+        recommendation = Recommendation(
+            recommendation_id="test_seed_recommendation",
+            resource_id=resource.resource_id,
+            category=RecommendationCategory.COST,
+            title="Test cost optimization",
+            action="Resize the test EC2 instance",
+            rationale="The test resource can be optimized.",
+            estimated_monthly_savings_usd=50.0,
+            confidence="high",
+            state=RecommendationState.PENDING,
+        )
+
+        session.add(recommendation)
+        session.commit()
+
+    # Override the application's database dependency.
+    def override_get_db():
+        db = TestSessionLocal()
+        try:
+            yield db
+        finally:
+            db.close()
+
+    previous_overrides = app.dependency_overrides.copy()
+    app.dependency_overrides[get_db] = override_get_db
+
+    try:
+        with TestClient(app) as test_client:
+            yield test_client
+    finally:
+        app.dependency_overrides.clear()
+        app.dependency_overrides.update(previous_overrides)
+        test_engine.dispose()
 
 
 def test_base_health_and_openapi_routes(client: TestClient) -> None:
@@ -73,7 +145,9 @@ def test_get_overview(client: TestClient) -> None:
     )
     assert len(data["cost_usage_trend"]) >= 5
     first_point = data["cost_usage_trend"][0]
-    assert {"date", "daily_cost_usd", "avg_cpu_pct", "request_count"}.issubset(first_point.keys())
+    assert {"date", "daily_cost_usd", "avg_cpu_pct", "request_count"}.issubset(
+        first_point.keys()
+    )
 
 
 def test_get_resources_and_filters(client: TestClient) -> None:
@@ -93,13 +167,19 @@ def test_get_resources_and_filters(client: TestClient) -> None:
     assert ec2_data["summary"]["total"] >= 1
     assert all(item["resource_type"] == "ec2" for item in ec2_data["resources"])
 
-    missing_backup_resp = client.get("/api/v1/resources", params={"backup_status": "missing"})
+    missing_backup_resp = client.get(
+        "/api/v1/resources",
+        params={"backup_status": "missing"},
+    )
     assert missing_backup_resp.status_code == 200
     missing_data = missing_backup_resp.json()
     assert missing_data["summary"]["unprotected_count"] == missing_data["summary"]["total"]
     assert all(item["backup_status"] == "missing" for item in missing_data["resources"])
 
-    region_resp = client.get("/api/v1/resources", params={"region": "ap-southeast-1"})
+    region_resp = client.get(
+        "/api/v1/resources",
+        params={"region": "ap-southeast-1"},
+    )
     assert region_resp.status_code == 200
     region_data = region_resp.json()
     assert region_data["summary"]["total"] >= 1
@@ -123,13 +203,19 @@ def test_get_alerts_and_filters(client: TestClient) -> None:
     assert "iam_risk" in first_alert["signal_breakdown"]
     assert "cost_impact" in first_alert["signal_breakdown"]
 
-    sev_filter = client.get("/api/v1/alerts", params={"severity": first_alert["severity"]})
+    sev_filter = client.get(
+        "/api/v1/alerts",
+        params={"severity": first_alert["severity"]},
+    )
     assert sev_filter.status_code == 200
     sev_data = sev_filter.json()
     assert sev_data["total"] >= 1
     assert all(item["severity"] == first_alert["severity"] for item in sev_data["alerts"])
 
-    status_filter = client.get("/api/v1/alerts", params={"status": "investigating"})
+    status_filter = client.get(
+        "/api/v1/alerts",
+        params={"status": "investigating"},
+    )
     assert status_filter.status_code == 200
     status_data = status_filter.json()
     assert all(item["status"] == "investigating" for item in status_data["alerts"])
@@ -172,8 +258,14 @@ def test_recommendations_list_and_action_toggle(client: TestClient) -> None:
     assert approve_data["recommendation"]["state"] == "approved"
 
     # Confirm state persisted on subsequent GET.
-    approved_list = client.get("/api/v1/recommendations", params={"state": "approved"}).json()
-    assert any(item["recommendation_id"] == target_id for item in approved_list["recommendations"])
+    approved_list = client.get(
+        "/api/v1/recommendations",
+        params={"state": "approved"},
+    ).json()
+    assert any(
+        item["recommendation_id"] == target_id
+        for item in approved_list["recommendations"]
+    )
 
     # Toggle to dismissed.
     dismiss_resp = client.post(

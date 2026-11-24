@@ -1,12 +1,15 @@
+
 """Correlated security and cost alerts endpoint."""
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timezone
 
-from fastapi import APIRouter, Query
+from fastapi import APIRouter, Depends, Query
 from pydantic import BaseModel, Field
+from sqlalchemy.orm import Session
 
+from app.core.database import get_db
 from app.models.entities import AlertSeverity, AlertStatus
 from app.services.correlator import (
     CloudTrailEvent,
@@ -15,6 +18,7 @@ from app.services.correlator import (
     SignalBreakdown,
     correlate_signals,
 )
+from app.services.repository import list_alerts
 
 router = APIRouter(prefix="/api/v1", tags=["alerts"])
 
@@ -46,9 +50,9 @@ class AlertsResponse(BaseModel):
 
 def _build_sample_alerts() -> tuple[AlertItem, ...]:
     """Generate deterministic static alerts via the correlation engine."""
+
     incidents = correlate_signals(
         cloudtrail_events=[
-            # Scenario 1: Compromised IAM key in unused ap-southeast-1 region
             CloudTrailEvent(
                 event_id="ct-9001",
                 timestamp="2026-11-21T02:14:00Z",
@@ -79,7 +83,6 @@ def _build_sample_alerts() -> tuple[AlertItem, ...]:
                 is_anomalous=True,
                 risk_hint=0.94,
             ),
-            # Scenario 3: Moderate configuration change on orders RDS
             CloudTrailEvent(
                 event_id="ct-9010",
                 timestamp="2026-11-20T16:10:00Z",
@@ -102,7 +105,6 @@ def _build_sample_alerts() -> tuple[AlertItem, ...]:
                 region="ap-southeast-1",
                 anomaly_score=0.93,
             ),
-            # Scenario 2: Automated bot scraper traffic driving web tier CPU + cost
             MetricSpike(
                 event_id="cw-9021",
                 timestamp="2026-11-20T19:05:00Z",
@@ -123,7 +125,6 @@ def _build_sample_alerts() -> tuple[AlertItem, ...]:
                 region="us-east-1",
                 anomaly_score=0.81,
             ),
-            # Scenario 3: Correlated RDS CPU pressure
             MetricSpike(
                 event_id="cw-9011",
                 timestamp="2026-11-20T16:28:00Z",
@@ -162,8 +163,14 @@ def _build_sample_alerts() -> tuple[AlertItem, ...]:
     )
 
     items: list[AlertItem] = []
+
     for index, inc in enumerate(incidents):
-        status = AlertStatus.INVESTIGATING if index == 1 else AlertStatus.OPEN
+        alert_status = (
+            AlertStatus.INVESTIGATING
+            if index == 1
+            else AlertStatus.OPEN
+        )
+
         items.append(
             AlertItem(
                 alert_id=f"alert_{inc.incident_id}",
@@ -177,26 +184,119 @@ def _build_sample_alerts() -> tuple[AlertItem, ...]:
                 signal_breakdown=inc.signal_breakdown,
                 summary=inc.summary,
                 recommended_actions=inc.recommended_actions,
-                status=status,
+                status=alert_status,
                 created_at=inc.window_end,
             )
         )
+
     return tuple(items)
 
 
-_SAMPLE_ALERTS: tuple[AlertItem, ...] = _build_sample_alerts()
+_SAMPLE_ALERTS = _build_sample_alerts()
+
+
+def _datetime_sort_key(value: datetime) -> float:
+    """Normalize naive and timezone-aware datetimes for sorting."""
+
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=timezone.utc)
+
+    return value.timestamp()
+
+
+def _convert_db_alert(alert) -> AlertItem:
+    """Convert a SQLAlchemy SecurityAlert into the API response schema."""
+
+    raw_breakdown = alert.signal_breakdown or {}
+
+    # Simulation alerts use a simplified breakdown.
+    # Normalize it to the SignalBreakdown schema.
+    breakdown = SignalBreakdown(
+        cloudtrail_count=int(raw_breakdown.get("cloudtrail_count", 0)),
+        metric_spike_count=int(raw_breakdown.get("metric_spike_count", 0)),
+        cost_delta_count=int(raw_breakdown.get("cost_delta_count", 0)),
+        iam_risk=float(
+            raw_breakdown.get(
+                "iam_risk",
+                alert.risk_score if alert.alert_type == "iam_breach" else 0.0,
+            )
+        ),
+        resource_impact=float(
+            raw_breakdown.get(
+                "resource_impact",
+                raw_breakdown.get("risk_score", alert.risk_score),
+            )
+        ),
+        cost_impact=float(raw_breakdown.get("cost_impact", 0.0)),
+        traffic_anomaly=float(
+            raw_breakdown.get(
+                "traffic_anomaly",
+                alert.risk_score if alert.alert_type == "bot_traffic" else 0.0,
+            )
+        ),
+        total_cost_delta_usd=float(
+            raw_breakdown.get("total_cost_delta_usd", 0.0)
+        ),
+    )
+
+    resource_ids = [alert.resource_id] if alert.resource_id else []
+
+    return AlertItem(
+        alert_id=alert.alert_id,
+        resource_id=alert.resource_id,
+        resource_ids=resource_ids,
+        alert_type=alert.alert_type,
+        severity=alert.severity,
+        risk_score=alert.risk_score,
+        title=alert.title,
+        correlated_event_ids=alert.correlated_event_ids or [],
+        signal_breakdown=breakdown,
+        summary=alert.ai_summary or "",
+        recommended_actions=alert.recommended_actions or [],
+        status=alert.status,
+        created_at=alert.created_at,
+    )
 
 
 @router.get("/alerts", response_model=AlertsResponse)
 def get_alerts(
     severity: AlertSeverity | None = Query(default=None),
     status: AlertStatus | None = Query(default=None),
+    db: Session = Depends(get_db),
 ) -> AlertsResponse:
-    """Return correlated security and cost-impact alerts with risk score breakdowns."""
+    """Return sample and persisted alerts with optional filters."""
+
+    # Start with the existing sample alerts.
+    alerts_by_id = {
+        alert.alert_id: alert.model_copy(deep=True)
+        for alert in _SAMPLE_ALERTS
+    }
+
+    # Depends is not resolved when the function is called directly
+    # outside FastAPI (for example, by a unit test).
+    if isinstance(db, Session):
+        # Add database alerts. Database records take priority on duplicate IDs.
+        database_alerts = list_alerts(db)
+
+        for db_alert in database_alerts:
+            alerts_by_id[db_alert.alert_id] = _convert_db_alert(db_alert)
+
     filtered = [
         alert
-        for alert in _SAMPLE_ALERTS
+        for alert in alerts_by_id.values()
         if (severity is None or alert.severity == severity)
         and (status is None or alert.status == status)
     ]
-    return AlertsResponse(total=len(filtered), alerts=filtered)
+
+    filtered.sort(
+        key=lambda alert: (
+            alert.risk_score,
+            _datetime_sort_key(alert.created_at),
+        ),
+        reverse=True,
+    )
+
+    return AlertsResponse(
+        total=len(filtered),
+        alerts=filtered,
+    )

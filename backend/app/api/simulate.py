@@ -2,14 +2,26 @@
 """Scenario simulation endpoint for AWSense."""
 
 from typing import Any, Literal
+from uuid import uuid4
 
-from fastapi import APIRouter
+from fastapi import APIRouter, Depends
 from pydantic import BaseModel
+from sqlalchemy.orm import Session
 
-from app.services.auditor import (
-    audit_resources,
-    summarize_traffic_impact,
+from app.core.database import get_db
+from app.models.entities import (
+    AlertSeverity,
+    AlertStatus,
+    BackupStatus,
+    CloudResource,
+    Recommendation,
+    RecommendationCategory,
+    RecommendationState,
+    ResourceType,
 )
+from app.services.ai_explainer import explain_incident
+from app.services.auditor import audit_resources, summarize_traffic_impact
+from app.services.repository import save_alert
 from app.services.telemetry_provider import get_telemetry_provider
 
 
@@ -32,6 +44,22 @@ class SimulationResponse(BaseModel):
     incident: SimulationIncident
     findings: list[str]
     recommendations: list[dict[str, Any]]
+
+
+SIMULATED_RESOURCES = {
+    "iam_breach": {
+        "resource_id": "i-sim-iam-001",
+        "name": "Simulated IAM Breach Resource",
+    },
+    "bot_traffic": {
+        "resource_id": "i-sim-web-001",
+        "name": "Simulated Web Traffic Resource",
+    },
+    "resource_waste": {
+        "resource_id": "i-sim-waste-001",
+        "name": "Simulated Resource Waste",
+    },
+}
 
 
 def simulate_iam_breach(provider: Any) -> SimulationResponse:
@@ -220,14 +248,134 @@ def simulate_resource_waste(provider: Any) -> SimulationResponse:
     )
 
 
+def _ensure_simulated_resource(
+    db: Session,
+    scenario: str,
+) -> str:
+    """Create or update the simulated resource required by a scenario."""
+    config = SIMULATED_RESOURCES[scenario]
+    resource_id = config["resource_id"]
+
+    resource = db.get(CloudResource, resource_id)
+
+    if resource is None:
+        resource = CloudResource(
+            resource_id=resource_id,
+            name=config["name"],
+            resource_type=ResourceType.EC2,
+            region="us-east-1",
+            status="running",
+            utilization_pct=0.0,
+            backup_status=BackupStatus.NOT_APPLICABLE,
+            monthly_cost_usd=0.0,
+            metadata_json={"simulated": True, "scenario": scenario},
+        )
+        db.add(resource)
+    else:
+        resource.name = config["name"]
+        resource.status = "running"
+        resource.metadata_json = {
+            **(resource.metadata_json or {}),
+            "simulated": True,
+            "scenario": scenario,
+        }
+
+    # Make sure the parent resource exists before saving child records.
+    db.flush()
+    return resource_id
+
+
+def _persist_simulation(
+    db: Session,
+    scenario: str,
+    response: SimulationResponse,
+) -> None:
+    """Enrich and persist a simulated incident and its recommendations."""
+    resource_id = _ensure_simulated_resource(db, scenario)
+
+    incident_data = {
+        "title": response.incident.title,
+        "resource_ids": [resource_id],
+        "signals": response.findings,
+        "signal_breakdown": {
+            "risk_score": response.incident.risk_score,
+            "findings_count": len(response.findings),
+            "recommendations_count": len(response.recommendations),
+        },
+    }
+
+    explanation = explain_incident(incident_data)
+
+    response.incident.summary = explanation["summary"]
+    response.incident.recommended_actions = explanation["recommended_actions"]
+
+    severity = AlertSeverity(response.incident.severity.lower())
+
+    save_alert(
+        db,
+        {
+            "alert_id": f"sim_alert_{scenario}",
+            "resource_id": resource_id,
+            "alert_type": scenario,
+            "severity": severity,
+            "risk_score": response.incident.risk_score,
+            "title": response.incident.title,
+            "correlated_event_ids": [],
+            "signal_breakdown": incident_data["signal_breakdown"],
+            "ai_summary": explanation["summary"],
+            "recommended_actions": explanation["recommended_actions"],
+            "status": AlertStatus.OPEN,
+        },
+    )
+
+    recommendation_records = []
+
+    for item in response.recommendations:
+        category_value = str(item.get("category", "cost")).lower()
+
+        if category_value == "security":
+            category = RecommendationCategory.SECURITY
+        elif category_value == "backup":
+            category = RecommendationCategory.BACKUP
+        else:
+            # "optimization" is represented by the supported COST category.
+            category = RecommendationCategory.COST
+
+        recommendation_records.append(
+            Recommendation(
+                recommendation_id=f"sim_{uuid4().hex}",
+                resource_id=resource_id,
+                category=category,
+                title=str(item.get("title", "Simulation recommendation")),
+                action=str(item.get("action", "Review this recommendation.")),
+                rationale=f"Generated by the {scenario} simulation.",
+                estimated_monthly_savings_usd=float(
+                    item.get("estimated_monthly_savings_usd", 0.0) or 0.0
+                ),
+                confidence="high",
+                state=RecommendationState.PENDING,
+            )
+        )
+
+    if recommendation_records:
+        db.add_all(recommendation_records)
+
+    db.commit()
+
+
 @router.post("/simulate", response_model=SimulationResponse)
-def simulate_scenario(request: SimulationRequest) -> SimulationResponse:
+def simulate_scenario(
+    request: SimulationRequest,
+    db: Session = Depends(get_db),
+) -> SimulationResponse:
     provider = get_telemetry_provider("mock")
 
     if request.scenario == "iam_breach":
-        return simulate_iam_breach(provider)
+        response = simulate_iam_breach(provider)
+    elif request.scenario == "bot_traffic":
+        response = simulate_bot_traffic(provider)
+    else:
+        response = simulate_resource_waste(provider)
 
-    if request.scenario == "bot_traffic":
-        return simulate_bot_traffic(provider)
-
-    return simulate_resource_waste(provider)
+    _persist_simulation(db, request.scenario, response)
+    return response
