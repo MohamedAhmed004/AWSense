@@ -8,13 +8,15 @@ export default function Overview() {
     <Async state={state}>
       {(d) => {
         const total = Object.values(d.activeAlerts).reduce((a, b) => a + b, 0)
+        const latestCpu = d.trend.at(-1)?.cpu
+        const alertsAtRiskLevel = d.activeAlerts[d.riskLevel] ?? 0
         return (
           <div className="space-y-6">
             <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-4">
-              <Stat label="Cloud health" value={`${d.healthScore}/100`} note="Down from 91 last week" />
+              <Stat label="Cloud health" value={`${d.healthScore}/100`} note={Number.isFinite(latestCpu) ? `Latest average CPU: ${latestCpu}%` : undefined} />
               <Stat label="Active alerts" value={total} note={`${d.activeAlerts.CRITICAL} critical, ${d.activeAlerts.HIGH} high`} />
-              <Stat label="Monthly savings available" value={money(d.monthlySavings)} note="From pending recommendations" valueClass="text-low" />
-              <Stat label="Risk level" value={d.riskLevel[0] + d.riskLevel.slice(1).toLowerCase()} valueClass={SEVERITY_TEXT[d.riskLevel]} note="Driven by ALT-1042" />
+              <Stat label="Monthly savings available" value={money(d.monthlySavings)} valueClass="text-low" />
+              <Stat label="Risk level" value={d.riskLevel[0] + d.riskLevel.slice(1).toLowerCase()} valueClass={SEVERITY_TEXT[d.riskLevel]} note={total === 0 ? "No active alerts" : `${alertsAtRiskLevel} active at this severity`} />
             </div>
 
             <div className="grid gap-6 xl:grid-cols-3">
