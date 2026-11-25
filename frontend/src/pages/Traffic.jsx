@@ -4,14 +4,18 @@ import { Async, Card, Pill, Stat, useAsync, compact, money, chartTooltip } from 
 
 export default function Traffic() {
   const state = useAsync(getTraffic)
+  const peakRequests = state.data?.timeline.reduce(
+    (peak, point) => Math.max(peak, point.requests), 0,
+  )
+  const flaggedEndpoints = state.data?.patterns.filter((pattern) => pattern.bot).length
   return (
     <Async state={state}>
       {(d) => (
         <div className="space-y-6">
           <div className="grid gap-4 sm:grid-cols-3">
-            <Stat label="Requests in 24 hours" value={compact(d.totalRequests)} note="About 5K per hour is normal" />
-            <Stat label="Share from bots" value={`${Math.round(d.botShare * 100)}%`} valueClass="text-high" note="Across 3 flagged IP ranges" />
-            <Stat label="Extra cost from bot load" value={money(d.costImpact)} valueClass="text-crit" note="Scaling and data transfer today" />
+            <Stat label="Requests in 24 hours" value={compact(d.totalRequests)} note={d.timeline.length > 0 ? `Peak sample: ${compact(peakRequests)} requests` : undefined} />
+            <Stat label="Share from bots" value={`${Math.round(d.botShare * 100)}%`} valueClass="text-high" note={`${flaggedEndpoints} flagged endpoint${flaggedEndpoints === 1 ? "" : "s"}`} />
+            <Stat label="Extra cost from bot load" value={money(d.costImpact)} valueClass="text-crit" note={d.costImpact > 0 ? "Estimated from bot traffic" : "No extra cost reported"} />
           </div>
 
           <Card title="Request volume against CPU and cost">
