@@ -37,7 +37,7 @@ const STATUS_ACTIONS = {
 function SecurityFeed({ initial }) {
   const [items, setItems] = useState(initial)
   const [selectedId, setSelectedId] = useState(null)
-  const [loadingId, setLoadingId] = useState(null)
+  const [pending, setPending] = useState({})
   const [actionErrors, setActionErrors] = useState({})
 
   useEffect(() => setItems(initial), [initial])
@@ -51,7 +51,7 @@ function SecurityFeed({ initial }) {
       delete next[alertId]
       return next
     })
-    setLoadingId(alertId)
+    setPending((p) => ({ ...p, [alertId]: true }))
     try {
       await updateAlertStatus(alertId, nextStatus)
       setItems((prev) =>
@@ -60,7 +60,11 @@ function SecurityFeed({ initial }) {
     } catch (e) {
       setActionErrors((prev) => ({ ...prev, [alertId]: e.message || String(e) }))
     } finally {
-      setLoadingId(null)
+      setPending((p) => {
+        const n = { ...p }
+        delete n[alertId]
+        return n
+      })
     }
   }
 
@@ -119,7 +123,7 @@ function SecurityFeed({ initial }) {
                 <button
                   key={btn.label}
                   type="button"
-                  disabled={loadingId === a.id}
+                  disabled={!!pending[a.id]}
                   onClick={() => handleStatusChange(a.id, btn.status)}
                   className={`rounded-md px-3 py-1.5 text-xs font-semibold transition-colors disabled:cursor-not-allowed disabled:opacity-50 ${
                     btn.primary

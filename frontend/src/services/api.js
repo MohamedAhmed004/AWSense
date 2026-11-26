@@ -24,8 +24,12 @@ async function http(path, options = {}) {
     let detail = ''
     try {
       const data = await res.json()
-      if (data?.detail) detail = `: ${data.detail}`
-    } catch {}
+      const d = data?.detail
+      if (typeof d === 'string') detail = `: ${d}`
+      else if (Array.isArray(d)) detail = `: ${d.map((x) => x?.msg).filter(Boolean).join('; ')}`
+    } catch {
+      // response had no JSON body
+    }
     throw new Error(`Request to ${path} failed (${res.status})${detail}`)
   }
   return res.json()
@@ -55,10 +59,11 @@ export const actOnRecommendation = (id, action) =>
 export const updateAlertStatus = (id, status) => {
   if (USE_MOCK) {
     const found = mock.alerts.find((x) => x.id === id)
-    if (found) found.status = status
+    if (!found) throw new Error(`Alert ${id} not found`)
+    found.status = status
     return local({ id, status })
   }
-  return http(`/alerts/${id}/status`, {
+  return http(`/alerts/${encodeURIComponent(id)}/status`, {
     method: 'POST',
     body: JSON.stringify({ status }),
   })
