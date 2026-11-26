@@ -20,7 +20,14 @@ async function http(path, options = {}) {
     headers: { 'Content-Type': 'application/json' },
     ...options,
   })
-  if (!res.ok) throw new Error(`Request to ${path} failed (${res.status})`)
+  if (!res.ok) {
+    let detail = ''
+    try {
+      const data = await res.json()
+      if (data?.detail) detail = `: ${data.detail}`
+    } catch {}
+    throw new Error(`Request to ${path} failed (${res.status})${detail}`)
+  }
   return res.json()
 }
 
@@ -43,3 +50,16 @@ export const actOnRecommendation = (id, action) =>
         method: 'POST',
         body: JSON.stringify({ action }),
       }).then(adaptRecommendationAction)
+
+// status: 'open' | 'investigating' | 'resolved' | 'dismissed'
+export const updateAlertStatus = (id, status) => {
+  if (USE_MOCK) {
+    const found = mock.alerts.find((x) => x.id === id)
+    if (found) found.status = status
+    return local({ id, status })
+  }
+  return http(`/alerts/${id}/status`, {
+    method: 'POST',
+    body: JSON.stringify({ status }),
+  })
+}

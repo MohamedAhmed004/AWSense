@@ -1,4 +1,11 @@
 const VALID_SEVERITIES = new Set(['CRITICAL', 'HIGH', 'MEDIUM', 'LOW'])
+const VALID_ALERT_STATUSES = new Set(['open', 'investigating', 'resolved', 'dismissed'])
+
+function normalizeAlertStatus(value, fallback = 'open') {
+  const lower = String(value ?? '').trim().toLowerCase()
+  if (lower === 'acknowledged') return 'investigating'
+  return VALID_ALERT_STATUSES.has(lower) ? lower : fallback
+}
 
 const BACKUP_MAP = {
   protected: 'protected',
@@ -254,7 +261,7 @@ export function adaptAlerts(raw) {
       title: String(a?.title ?? ''),
       severity: normalizeSeverity(a?.severity, 'LOW'),
       riskScore: Math.round(clamp(Number(a?.risk_score ?? a?.riskScore ?? 0) || 0, 0, 100)),
-      status: String(a?.status ?? 'open').toLowerCase(),
+      status: normalizeAlertStatus(a?.status),
       timestamp,
       breakdown,
       events,

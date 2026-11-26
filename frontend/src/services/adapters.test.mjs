@@ -200,6 +200,13 @@ test('adaptAlerts builds 5-factor breakdown with exact weights and inferred even
   assert.equal(alert.events[0].time, '02:50')
   assert.match(alert.events[0].text, /ct-9001/)
 
+  // Status mapping checks: open, investigating, resolved, dismissed, acknowledged -> investigating
+  assert.equal(adaptAlerts([{ status: 'investigating' }])[0].status, 'investigating')
+  assert.equal(adaptAlerts([{ status: 'resolved' }])[0].status, 'resolved')
+  assert.equal(adaptAlerts([{ status: 'dismissed' }])[0].status, 'dismissed')
+  assert.equal(adaptAlerts([{ status: 'acknowledged' }])[0].status, 'investigating')
+  assert.equal(adaptAlerts([{ status: 'UNKNOWN' }])[0].status, 'open')
+
   assert.deepEqual(adaptAlerts(null), [])
 })
 

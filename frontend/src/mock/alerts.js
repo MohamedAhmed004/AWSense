@@ -61,7 +61,7 @@ export const alerts = [
   },
   {
     id: 'ALT-1039', title: 'Two unattached EBS volumes without snapshots',
-    severity: 'MEDIUM', riskScore: 38, status: 'acknowledged', timestamp: '2026-11-20T10:20:00Z',
+    severity: 'MEDIUM', riskScore: 38, status: 'investigating', timestamp: '2026-11-20T10:20:00Z',
     breakdown: parts(12, 5, 45, 40, 0),
     events: [
       { time: '10-18', text: 'vol-0123abcd detached from its instance', source: 'CloudTrail' },
